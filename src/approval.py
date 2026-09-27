@@ -47,9 +47,8 @@ def _api(method: str, **params):
     resp = requests.post(url, json=params, timeout=_TIMEOUT)
     if resp.status_code >= 400:
         log.error("telegram API error: status=%s body=%s", resp.status_code, resp.text)
-    return  # do not raise — skip this idea and continue
-        resp.raise_for_status()
-        data = resp.json()
+        return None  # skip this idea instead of crashing the whole run
+    data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"telegram {method} failed: {data.get('description', data)}")
     return data["result"]
