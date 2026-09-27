@@ -149,7 +149,6 @@ def send_digest() -> int:
     for idea in ideas:
         body = _format_idea(idea)
         log.info("approval: digest body for idea %s: %r", idea.get("id"), body)
-        # Strip HTML tags for plain-text mode
         plain = re.sub(r"<[^>]+>", "", body)
         plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
         _api("sendMessage", chat_id=chat, text=plain,
