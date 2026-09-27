@@ -32,6 +32,23 @@ requests — no async framework — which suits a short polling script run by th
 Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
 Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
 """
+"""Module 2 — Approval (Telegram Morning Digest).
+
+Contract:
+    what it does : sends the day's pending ideas to Telegram with Approve/Reject buttons;
+                   writes the operator's decision back to the ideas table.
+    how to use   : `send_digest()` to push; `process_responses()` to apply taps (polling).
+    depends on   : requests (Telegram Bot HTTP API), src.db, src.config.
+
+This is the ONLY human step (rule 16: keep the human approval layer). Each idea shows its
+source links so the operator can sanity-check (docs/08 §6). Three buttons: Approve (queue it),
+Reject (bad idea), Pass (soft skip — not posted, but not a hard reject). Soft-cap at
+APPROVAL_CAP (4-5) approvals to protect daily volume. We talk to the Bot HTTP API directly via
+requests — no async framework — which suits a short polling script run by the production workflow.
+
+Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
+Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
+"""
 from __future__ import annotations
 
 import html
