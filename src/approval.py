@@ -15,43 +15,8 @@ requests — no async framework — which suits a short polling script run by th
 Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
 Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
 """
-"""Module 2 — Approval (Telegram Morning Digest).
-
-Contract:
-    what it does : sends the day's pending ideas to Telegram with Approve/Reject buttons;
-                   writes the operator's decision back to the ideas table.
-    how to use   : `send_digest()` to push; `process_responses()` to apply taps (polling).
-    depends on   : requests (Telegram Bot HTTP API), src.db, src.config.
-
-This is the ONLY human step (rule 16: keep the human approval layer). Each idea shows its
-source links so the operator can sanity-check (docs/08 §6). Three buttons: Approve (queue it),
-Reject (bad idea), Pass (soft skip — not posted, but not a hard reject). Soft-cap at
-APPROVAL_CAP (4-5) approvals to protect daily volume. We talk to the Bot HTTP API directly via
-requests — no async framework — which suits a short polling script run by the production workflow.
-
-Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
-Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
-"""
-"""Module 2 — Approval (Telegram Morning Digest).
-
-Contract:
-    what it does : sends the day's pending ideas to Telegram with Approve/Reject buttons;
-                   writes the operator's decision back to the ideas table.
-    how to use   : `send_digest()` to push; `process_responses()` to apply taps (polling).
-    depends on   : requests (Telegram Bot HTTP API), src.db, src.config.
-
-This is the ONLY human step (rule 16: keep the human approval layer). Each idea shows its
-source links so the operator can sanity-check (docs/08 §6). Three buttons: Approve (queue it),
-Reject (bad idea), Pass (soft skip — not posted, but not a hard reject). Soft-cap at
-APPROVAL_CAP (4-5) approvals to protect daily volume. We talk to the Bot HTTP API directly via
-requests — no async framework — which suits a short polling script run by the production workflow.
-
-Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
-Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
-"""
 from __future__ import annotations
 
-import html
 import logging
 import os
 import time
@@ -63,12 +28,9 @@ from src import config, db
 
 log = logging.getLogger(__name__)
 
-# Allow the Telegram API base URL to be overridden via an env var so the pipeline can route
-# through a proxy (e.g. a Cloudflare Worker) when the runner cannot reach api.telegram.org
-# directly. Falls back to the public Telegram endpoint.
 _API_BASE = os.environ.get("TELEGRAM_API_BASE_URL", "https://api.telegram.org").rstrip("/")
 _BASE = _API_BASE + "/bot{token}/{method}"
-_TIMEOUT = 40  # HTTP timeout; must exceed the long-poll timeout below
+_TIMEOUT = 40
 
 _DECISION_TEXT = {
     "approved": "✅ Approved",
@@ -105,7 +67,6 @@ _NO_PREVIEW = {"is_disabled": True}
 
 
 def _source_label(url: str) -> str:
-    """'https://www.theguardian.com/world/…' -> 'theguardian.com'. Readable, never a raw URL."""
     host = urlparse(url if "://" in url else "http://" + url).netloc.lower()
     host = host.split("@")[-1].split(":")[0]
     for prefix in ("www.", "m.", "amp."):
@@ -115,7 +76,6 @@ def _source_label(url: str) -> str:
 
 
 def _format_sources(sources: list[str]) -> str:
-    """One line: up to _SOURCES_SHOWN publishers as tappable names, then '+N more'."""
     firsts: dict[str, str] = {}
     for s in sources:
         firsts.setdefault(_source_label(str(s)), str(s))
@@ -128,7 +88,6 @@ def _format_sources(sources: list[str]) -> str:
 
 
 def _format_idea(idea: dict) -> str:
-    """Plain-text digest body for one idea: title, hook, angle, then score + sources."""
     score = idea.get("est_score")
     score_str = f"{float(score):.2f}" if score is not None else "—"
     return (
@@ -140,12 +99,10 @@ def _format_idea(idea: dict) -> str:
 
 
 def _utf16_len(text: str) -> int:
-    """Telegram measures entity offsets in UTF-16 code units, not Python characters."""
     return len(text.encode("utf-16-le")) // 2
 
 
 def _decided_message(label: str, msg: dict) -> dict:
-    """editMessageText params that put the decision on top and keep the idea's formatting."""
     original = msg.get("text") or msg.get("caption") or ""
     prefix = f"{label}\n\n" if original else label
     shift = _utf16_len(prefix)
@@ -179,7 +136,6 @@ def send_digest() -> int:
 
 
 def _apply_callback(action: str, idea_id: int, cap: int) -> str:
-    """Apply one tap to the DB, enforcing the approval cap. Returns the decision label."""
     if action == "a":
         if len(db.get_approved_ideas()) >= cap:
             return "capped"
@@ -195,7 +151,6 @@ def _apply_callback(action: str, idea_id: int, cap: int) -> str:
 
 
 def _handle_update(update: dict, cap: int) -> str | None:
-    """Process one getUpdates entry. Returns the decision label, or None if not for us."""
     cq = update.get("callback_query")
     if not cq:
         return None
@@ -220,7 +175,6 @@ def _handle_update(update: dict, cap: int) -> str | None:
 
 
 def process_responses(max_seconds: int = 600, poll_timeout: int = 25, cap: int | None = None) -> int:
-    """Poll for button taps, write approved/rejected to db. Return #approved this run."""
     cap = cap if cap is not None else int(config.get("APPROVAL_CAP", "3"))
     deadline = time.monotonic() + max_seconds
     offset = None
@@ -236,4 +190,4 @@ def process_responses(max_seconds: int = 600, poll_timeout: int = 25, cap: int |
             if _handle_update(up, cap) == "approved":
                 approved += 1
     log.info("approval: %d approved this run.", approved)
-    return approved
+    return approvedv
