@@ -15,11 +15,28 @@ requests — no async framework — which suits a short polling script run by th
 Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
 Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
 """
+"""Module 2 — Approval (Telegram Morning Digest).
+
+Contract:
+    what it does : sends the day's pending ideas to Telegram with Approve/Reject buttons;
+                   writes the operator's decision back to the ideas table.
+    how to use   : `send_digest()` to push; `process_responses()` to apply taps (polling).
+    depends on   : requests (Telegram Bot HTTP API), src.db, src.config.
+
+This is the ONLY human step (rule 16: keep the human approval layer). Each idea shows its
+source links so the operator can sanity-check (docs/08 §6). Three buttons: Approve (queue it),
+Reject (bad idea), Pass (soft skip — not posted, but not a hard reject). Soft-cap at
+APPROVAL_CAP (4-5) approvals to protect daily volume. We talk to the Bot HTTP API directly via
+requests — no async framework — which suits a short polling script run by the production workflow.
+
+Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
+Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
+"""
 from __future__ import annotations
 
-import re
 import html
 import logging
+import os
 import time
 from urllib.parse import urlparse
 
@@ -29,7 +46,11 @@ from src import config, db
 
 log = logging.getLogger(__name__)
 
-_BASE = "https://api.telegram.org/bot{token}/{method}"
+# Allow the Telegram API base URL to be overridden via an env var so the pipeline can route
+# through a proxy (e.g. a Cloudflare Worker) when the runner cannot reach api.telegram.org
+# directly. Falls back to the public Telegram endpoint.
+_API_BASE = os.environ.get("TELEGRAM_API_BASE_URL", "https://api.telegram.org").rstrip("/")
+_BASE = _API_BASE + "/bot{token}/{method}"
 _TIMEOUT = 40  # HTTP timeout; must exceed the long-poll timeout below
 
 _DECISION_TEXT = {
@@ -45,7 +66,8 @@ def _api(method: str, **params):
     url = _BASE.format(token=config.require("TELEGRAM_BOT_TOKEN"), method=method)
     resp = requests.post(url, json=params, timeout=_TIMEOUT)
     if resp.status_code >= 400:
-        log.error("telegram API error: status=%s body=%s", resp.status_code, resp.text)
+        log.error("telegram API error: method=%s status=%s body=%s",
+                  method, resp.status_code, resp.text)
         return None
     data = resp.json()
     if not data.get("ok"):
@@ -61,11 +83,7 @@ def _keyboard(idea_id: int) -> dict:
     ]]}
 
 
-# How many publishers the digest names before collapsing the rest into "+N more". The operator
-# needs enough to see the idea is sourced from real outlets, not a wall of URLs to read.
 _SOURCES_SHOWN = 3
-# Every digest message is sent and edited with previews off: the preview card is the biggest
-# thing in the chat, and it previews only the first link, which says nothing about the idea.
 _NO_PREVIEW = {"is_disabled": True}
 
 
@@ -80,38 +98,27 @@ def _source_label(url: str) -> str:
 
 
 def _format_sources(sources: list[str]) -> str:
-    """One line: up to _SOURCES_SHOWN publishers as tappable names, then '+N more'.
-
-    Each source used to get its own '🔗 <full URL>' line. Google News reader links run 249-884
-    characters, and a digest idea carried up to 17 of them (2026-09-12), so one idea filled the
-    screen. The full list still ships in the YouTube description; the digest only needs the
-    publishers at a glance and a tap-through to check one.
-    """
-    firsts: dict[str, str] = {}  # label -> first URL from that publisher
+    """One line: up to _SOURCES_SHOWN publishers as tappable names, then '+N more'."""
+    firsts: dict[str, str] = {}
     for s in sources:
         firsts.setdefault(_source_label(str(s)), str(s))
     if not firsts:
-        return "📰 <b>no sources!</b>"
+        return "📰 no sources!"
     shown = list(firsts.items())[:_SOURCES_SHOWN]
-    links = " · ".join(f'<a href="{html.escape(u, quote=True)}">{html.escape(label)}</a>'
-                       for label, u in shown)
+    links = " · ".join(f"{label}" for label, u in shown)
     rest = len(sources) - len(shown)
-    return f"📰 {links}" + (f" <i>+{rest} more</i>" if rest > 0 else "")
+    return f"📰 {links}" + (f" +{rest} more" if rest > 0 else "")
 
 
 def _format_idea(idea: dict) -> str:
-    """Compact HTML message body for one idea: title, hook, angle, then score + sources on ONE
-    line. Sources stay tappable so the operator can still sanity-check one (docs/08 §6)."""
-    def esc(x):
-        return html.escape(str(x or ""))
-
+    """Plain-text digest body for one idea: title, hook, angle, then score + sources."""
     score = idea.get("est_score")
     score_str = f"{float(score):.2f}" if score is not None else "—"
     return (
-        f"<b>{esc(idea.get('title'))}</b>\n"
-        f"<i>Hook:</i> {esc(idea.get('hook'))}\n"
-        f"<i>Why it matters:</i> {esc(idea.get('angle'))}\n"
-        f"⭐ {score_str}  {_format_sources(idea.get('sources') or [])}"
+        f"{idea.get('title') or ''}\n\n"
+        f"Hook: {idea.get('hook') or ''}\n\n"
+        f"Why it matters: {idea.get('angle') or ''}\n\n"
+        f"Score: {score_str}  {_format_sources(idea.get('sources') or [])}"
     )
 
 
@@ -121,14 +128,7 @@ def _utf16_len(text: str) -> int:
 
 
 def _decided_message(label: str, msg: dict) -> dict:
-    """editMessageText params that put the decision on top and KEEP the idea's formatting.
-
-    Telegram hands the message back as plain `text` plus `entities` (bold, italic, links). This
-    used to re-send that plain text with parse_mode=HTML, which (a) dropped every link and all
-    formatting on the first tap and (b) failed outright — so the tap looked ignored — whenever
-    the text held '&' or '<', e.g. a title like "AT&T" or "S&P 500". Re-sending the entities,
-    shifted past the new label, keeps the message exactly as it was.
-    """
+    """editMessageText params that put the decision on top and keep the idea's formatting."""
     original = msg.get("text") or msg.get("caption") or ""
     prefix = f"{label}\n\n" if original else label
     shift = _utf16_len(prefix)
@@ -146,19 +146,20 @@ def send_digest() -> int:
         log.info("approval: no pending ideas to send.")
         return 0
     chat = config.require("TELEGRAM_CHAT_ID")
+    log.info("approval: sending digest to chat_id=%r (base=%s)", chat, _API_BASE)
+    sent = 0
     for idea in ideas:
-        # Plain-text digest: no HTML, no parse_mode, no tag parsing errors
-        text = (
-            f"{idea.get('title', '')}\n\n"
-            f"Hook: {idea.get('hook', '')}\n\n"
-            f"Why it matters: {idea.get('angle', '')}\n\n"
-            f"Score: {idea.get('est_score', '—')}"
-        )
-        _api("sendMessage", chat_id=chat, text=text,
-             link_preview_options=_NO_PREVIEW,
-             reply_markup=_keyboard(idea["id"]))
-    log.info("approval: sent %d ideas to the digest.", len(ideas))
-    return len(ideas)
+        text = _format_idea(idea)
+        result = _api("sendMessage", chat_id=chat, text=text,
+                      link_preview_options=_NO_PREVIEW,
+                      reply_markup=_keyboard(idea["id"]))
+        if result is None:
+            log.warning("approval: skipping idea %s (send failed)", idea.get("id"))
+        else:
+            sent += 1
+    log.info("approval: sent %d/%d ideas to the digest.", sent, len(ideas))
+    return sent
+
 
 def _apply_callback(action: str, idea_id: int, cap: int) -> str:
     """Apply one tap to the DB, enforcing the approval cap. Returns the decision label."""
@@ -202,10 +203,7 @@ def _handle_update(update: dict, cap: int) -> str | None:
 
 
 def process_responses(max_seconds: int = 600, poll_timeout: int = 25, cap: int | None = None) -> int:
-    """Poll for button taps, write approved/rejected to db. Return #approved this run.
-
-    Stops early once no pending ideas remain (everything decided), else after max_seconds.
-    """
+    """Poll for button taps, write approved/rejected to db. Return #approved this run."""
     cap = cap if cap is not None else int(config.get("APPROVAL_CAP", "3"))
     deadline = time.monotonic() + max_seconds
     offset = None
