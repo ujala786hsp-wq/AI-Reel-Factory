@@ -146,7 +146,9 @@ def send_digest() -> int:
         return 0
     chat = config.require("TELEGRAM_CHAT_ID")
     for idea in ideas:
-        _api("sendMessage", chat_id=chat, text=_format_idea(idea), parse_mode="HTML",
+       body = _format_idea(idea)
+log.info("approval: digest body for idea %s: %r", idea.get("id"), body)
+_api("sendMessage", chat_id=chat, text=body, parse_mode="HTML",
              link_preview_options=_NO_PREVIEW, reply_markup=_keyboard(idea["id"]))
     log.info("approval: sent %d ideas to the digest.", len(ideas))
     return len(ideas)
