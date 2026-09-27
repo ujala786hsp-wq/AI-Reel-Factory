@@ -17,6 +17,7 @@ Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
 """
 from __future__ import annotations
 
+import re
 import html
 import logging
 import time
@@ -148,11 +149,13 @@ def send_digest() -> int:
     for idea in ideas:
         body = _format_idea(idea)
         log.info("approval: digest body for idea %s: %r", idea.get("id"), body)
-        _api("sendMessage", chat_id=chat, text=body, parse_mode="HTML",
+        # Strip HTML tags for plain-text mode
+        plain = re.sub(r"<[^>]+>", "", body)
+        plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        _api("sendMessage", chat_id=chat, text=plain,
              link_preview_options=_NO_PREVIEW, reply_markup=_keyboard(idea["id"]))
     log.info("approval: sent %d ideas to the digest.", len(ideas))
     return len(ideas)
-
 
 def _apply_callback(action: str, idea_id: int, cap: int) -> str:
     """Apply one tap to the DB, enforcing the approval cap. Returns the decision label."""
