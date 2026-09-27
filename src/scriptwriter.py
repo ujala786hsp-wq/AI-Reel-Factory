@@ -1,4 +1,4 @@
-"""Module 3 — Scriptwriter.
+"""Module 3 — Scriptwriter (History Documentary).
 
 Contract:
     what it does : turns an approved idea (+ its sources) into a script via a template.
@@ -12,8 +12,9 @@ include source links + an AI-disclosure line. Keyword-rich title (SEO). Append #
 
 The compliance requirements (source links, AI-disclosure line, #Shorts) are enforced in
 code AFTER the LLM responds — never trusted to the model, because they gate monetization.
-The executable prompt below mirrors templates/template-N-news-impact.md (the design source);
-keep the two in sync.
+
+TONE: cinematic, authoritative, and reflective — like a BBC documentary voiceover. The
+delivery tags are [serious], [curious], [whispers], [pause] — NOT sarcastic or deadpan.
 """
 from __future__ import annotations
 
@@ -34,13 +35,11 @@ DISCLOSURE_LINE = "AI-generated narration; stock visuals."
 # Only Template N is in the Phase-1 MVP (rule 9 / YAGNI). The others exist as docs.
 _SUPPORTED_TEMPLATES = ("N",)
 
-_PROMPT_N = """You are the lead viral scriptwriter for "But It Matters" — sharp **25-30 SECOND** YouTube \
-Shorts with a SARCASTIC, dryly funny, roasted, but DEAD-SERIOUS voice (think Daily Show / Phil DeFranco \
-meets clever friend). You explain real news with razor-sharp wit and a knowing eye-roll at the \
-absurdity, then land a genuinely useful, HONEST "why it matters" point. Funny in the DELIVERY, \
-never in the facts. Your voice is NATURAL and conversational with real edge — energetic, gripping, \
-never a stiff news-anchor. The hook is strong but TRUE: the title and opening must sit honestly \
-on what the video actually delivers — a click-then-bounce from an over-claim gets the channel suppressed.
+_PROMPT_N = """You are the lead documentary scriptwriter for a history channel — cinematic, \
+authoritative, and reflective narration for **45-55 SECOND** YouTube Shorts. Your voice is the \
+calm, knowing storyteller of a BBC or Ken Burns documentary: measured, vivid, and deeply human. \
+You make the past feel immediate and consequential without ever lecturing or sensationalizing. \
+No sarcasm, no jokes, no modern commentary — the story itself carries the weight.
 
 IDEA: {title}
 HOOK: {hook}
@@ -48,64 +47,61 @@ ANGLE (the take to develop): {angle}
 SOURCES:
 {sources}
 
-WHAT WINS ON THIS CHANNEL: a disorienting curiosity gap the video actually CLOSES. Lead with the single \
-most surprising, absurd, or high-tension TRUE fact. Follow up immediately with a retention bridge \
-("Here's the catch...", "Wait, it gets weirder...") to keep viewers hooked before the payoff. \
-Promise == payoff.
+WHAT WINS ON THIS CHANNEL: a single vivid moment or surprising truth that opens a window into \
+a larger historical story. Lead with a specific image, sound, or decision — not a summary. \
+The viewer should feel they are THERE, then understand why it still matters. Promise == payoff.
 
-Write a **25-30 SECOND** narration — about **65-75 words** (aim for the FULL 25-30 seconds; do not \
-cut it short). Sarcastic, witty, and roasting, but the facts stay straight. Structure it:
-1. DISORIENTING HOOK (first ~2s): the single most surprising or absurd TRUE fact, stated instantly \
-with a dry edge. No "in this video", no throat-clearing, no fake hype.
-2. THE ABSURDITY (2-3 crisp sentences): exactly what happened, in your own words, accurate — with a \
-sarcastic aside on the absurdity (never changing a fact).
-3. RETENTION BRIDGE & THE POINT (1-2 sentences): "Here's why it actually matters..." — the real \
-consequence or "so what", said straight and honest.
-4. PUNCHY CLOSE: a witty last line that loops naturally back to the opening hook + 2-3 word CTA.
-Fill the full 25-30 seconds — don't end early. Read it aloud to check the comedic timing.
+Write a **45-55 SECOND** narration — about **110-135 words** (aim for the FULL length; do not \
+cut it short). Structure it:
+1. VIVID OPENING (first ~3s): a specific moment, image, or decision that drops the viewer into \
+the story. No "in this video", no throat-clearing, no rhetorical questions.
+2. CONTEXT & TENSION (3-4 sentences): what was at stake, who was involved, what hung in the \
+balance — in your own words, accurate, with sensory detail.
+3. THE TURN (1-2 sentences): the consequence or revelation — "Here's why it matters..." — said \
+plainly and with weight.
+4. REFLECTIVE CLOSE: a final line that echoes the opening image and lands the legacy + 2-3 word \
+CTA. Fill the full 45-55 seconds — don't end early. Read it aloud to check the pacing.
 
-WRITE FOR THE EAR: short punchy sentences, contractions, natural rhythm, dry comic timing. Sound \
-like a sharp, sarcastic friend who finds the absurdity in the news but means the serious parts — \
-not an essay. No hateful or personal attacks; roast situations and irony, not people \
-(harassment = demonetization).
+WRITE FOR THE EAR: short punchy sentences, natural rhythm, deliberate pauses. Sound like a \
+documentary narrator — not an essay, not a news anchor, not a teacher. No hateful or personal \
+attacks; the historical record speaks for itself.
 
 DELIVERY DIRECTION (this is how it will be READ ALOUD):
-Write for the ear first. Short punchy sentences, contractions, natural rhythm. Use "..." for a \
-deliberate beat or hesitation — it changes the timing on every voice engine.
+Write for the ear first. Short sentences, natural rhythm. Use "..." for a deliberate beat or \
+hesitation — it changes the timing on every voice engine.
 Then add AT LEAST 1 and AT MOST 3 delivery tags. The one that is REQUIRED is a tone tag on the \
-"why it matters" turn — that line is the whole point of the video, and read in the same dry \
-register as the joke before it, it lands as one more punchline. The rest are optional:
-- [pause] or [pause long] for a comic beat before a punchline or the "why it matters" turn.
-- [sarcastic], [deadpan] or [dry] immediately before the line whose TONE flips.
-- [serious] for the "why it matters" turn when the subject deserves it — this is the one that \
-tells the audience you actually mean it.
-- [curious] on an opening question, [whispers] on a conspiratorial aside, [tired] on \
-institutional absurdity, [mischievously] before a setup you are about to puncture.
+"why it matters" turn — that line is the whole point of the video, and read in the same calm \
+register as the story before it, it can fade into the background. The rest are optional:
+- [pause] or [pause long] for a beat before a revelation or the "why it matters" turn.
+- [serious] for the "why it matters" turn — this is the one that tells the audience you mean it.
+- [curious] on an opening image or question, [whispers] on a quiet, intimate aside, [pause] before \
+a name, date, or consequence lands.
 Tags are stage direction, never narration — never write a tag the sentence already says out \
 loud, and never open the script with one. Fewer is better: a tag on every line reads as noise. \
-The failure mode is a narrator who ANNOUNCES the joke; restraint reads as confidence.
+The failure mode is a narrator who ANNOUNCES the gravity; restraint reads as confidence.
 
-ACCURACY (THE ONE HARD LINE): VERIFY the development actually \
-happened (use the sources + web search). State ONLY facts you can support. NEVER invent product \
-names, version numbers, figures, dates, quotes, or events. Sharpen the FRAMING, never fabricate the \
-STORY — a made-up fact gets the channel struck and demonetized.
+ACCURACY (THE ONE HARD LINE): VERIFY the historical event actually happened (use the sources + \
+web search). State ONLY facts you can support. NEVER invent names, dates, quotes, figures, or \
+events. Sharpen the FRAMING, never fabricate the STORY — a made-up fact gets the channel struck \
+and demonetized. If the record is disputed, say so plainly.
 
-TRUTH OVER NEUTRALITY: you are NOT required to be even-handed. If the evidence points one way, \
-say so plainly and name who is responsible — a well-sourced conclusion is not bias, and hedging a \
-clear finding into mush is its own kind of dishonesty. The trade is strict: the sharper your \
-verdict, the more certain its supporting facts must be. Every load-bearing claim has to be \
-something a viewer could check. Opinion is earned by evidence, never asserted without it. An \
-independent fact-check runs on this script before it is voiced, and unsupported claims kill the \
-reel — so do not reach for a punchier claim than your sources can carry.
+TRUTH OVER NEUTRALITY: you are NOT required to be even-handed when the historical record points \
+one way. If the evidence is clear, say so — a well-sourced conclusion is not bias. But the trade \
+is strict: the sharper your verdict, the more certain its supporting facts must be. Every \
+load-bearing claim has to be something a viewer could check. An independent fact-check runs on \
+this script before it is voiced, and unsupported claims kill the reel — so do not reach for a \
+dramatic claim than your sources can carry.
 
 ALSO produce, for the feed + discoverability:
-- "title": a clear, curiosity-driven YouTube title (<=70 chars) that is TRUE to the video — front-loading the most interesting REAL word.
+- "title": a clear, curiosity-driven YouTube title (<=70 chars) that is TRUE to the video — \
+front-loading the most interesting REAL word.
 - "caption": an ATTRACTIVE, high-retention YouTube description structured cleanly:
   Line 1: A gripping curiosity hook with a relevant emoji (YouTube shows ~2 lines in-feed to make viewers click 'more').
-  Line 2: A 1-2 sentence compelling summary of why this matters + a comment trigger question (e.g., "💬 What's your take on this? Comment below!").
+  Line 2: A 1-2 sentence compelling summary of why this matters + a comment trigger question (e.g., "💬 What surprised you most? Comment below!").
   Line 3: The real source link(s).
-- "tags": 12-15 specific high-traffic search terms & long-tail phrases people type on YouTube (topic, key figures, orgs, category, and close search intent synonyms). No '#'.
-- "key_points": 2-3 ULTRA-SHORT on-screen text cards (<=4 words each) — punchiest facts or numbers.
+- "tags": 12-15 specific high-traffic search terms & long-tail phrases people type on YouTube \
+(topic, key figures, places, era, and close search intent synonyms). No '#'.
+- "key_points": 2-3 ULTRA-SHORT on-screen text cards (<=4 words each) — punchiest facts or dates.
 
 Return ONLY a JSON object, no markdown fences. Write every line break inside a string as the \
 two-character escape \\n — a raw newline inside a JSON string is invalid JSON:
@@ -130,7 +126,7 @@ def _build_prompt(idea: dict, template: str) -> str:
     # The human "why it matters" take is the originality + anti-"AI-slop" signal (2026 policy).
     if config.get_bool("ENABLE_HUMAN_ANGLE", True):
         prompt += ("\n\nEMPHASIS: the \"why it matters\" analysis is the point of the video — make "
-                   "it a genuine, specific human take, not a generic restatement.")
+                   "it a genuine, specific historical take, not a generic restatement.")
     return prompt
 
 
@@ -176,19 +172,20 @@ NARRATION:
 {body}
 
 STEP 1 — Score the CURRENT opening line (the first ~3 seconds) from 1 to 10 on raw scroll-stopping \
-power: 10 = a shocking, curiosity-exploding hook nobody could scroll past; 1 = a flat, slow, \
+power: 10 = a vivid, curiosity-exploding hook nobody could scroll past; 1 = a flat, slow, \
 "explainer" intro.
 
 STEP 2 — Rewrite for stronger HONEST pull (only when the score is below 7, i.e. genuinely flat):
 - TITLE: a clear curiosity gap or real stakes, front-loading the most interesting TRUE word. It \
 must stay honest to the narration — never promise something the body doesn't deliver.
-- OPENING: replace the first 1-2 sentences with a stronger TRUE hook — the most surprising fact \
-already in the script, or a real question the viewer needs answered. Keep the rest of the narration.
+- OPENING: replace the first 1-2 sentences with a stronger TRUE hook — the most vivid image or \
+surprising fact already in the script, or a real question the viewer needs answered. Keep the \
+rest of the narration.
 
 HARD RULE — DO NOT add, remove, or change any FACT, name, number, date, quote, statistic, or claim. \
 Every factual statement must stay exactly as true as the original. You may ONLY re-word, re-order, \
-and intensify the DELIVERY. Keep it a tight 25-30 SECOND bite (~65-75 words) — sharpen wording but \
-NEVER lengthen it — and keep the closing CTA / loop-back line.
+and intensify the DELIVERY. Keep it a tight 45-55 SECOND bite (~110-135 words) — sharpen wording \
+but NEVER lengthen it — and keep the closing CTA / loop-back line.
 
 OUTPUT — return ONE valid JSON object and NOTHING else. No markdown, no code fences, no commentary:
 {{"hook_score": 7, "title": "the punchier title", "script_body": "the full narration with a punchier opening"}}
@@ -224,8 +221,8 @@ def _punch_up_hook(title: str, body: str) -> tuple[str, str]:
 
     new_body = (data.get("script_body") or "").strip()
     new_title = (data.get("title") or "").strip()
-    max_words = int(config.get("SCRIPT_MAX_WORDS", "80"))
-    if new_body and 40 <= len(_visible_words(new_body)) <= max_words:  # accept only if it stayed short
+    max_words = int(config.get("SCRIPT_MAX_WORDS", "135"))
+    if new_body and 80 <= len(_visible_words(new_body)) <= max_words:  # accept only if it stayed short
         log.info("scriptwriter: punched up a weak hook (score %d).", score)
         return (new_title or title), new_body
     log.info("scriptwriter: punch-up rewrite unusable (score %d); keeping original.", score)
@@ -241,9 +238,9 @@ _PIECE_RE = re.compile(r"\[[^\]]*\]|[^\s\[]+")
 
 
 def _visible_words(body: str) -> list[str]:
-    """Words the narrator actually SAYS — inline delivery tags ([pause], [sarcastic]) are stage
+    """Words the narrator actually SAYS — inline delivery tags ([pause], [serious]) are stage
     direction for the TTS engine, not narration. Counting them would silently shrink the
-    25-30s script budget every time the model added one."""
+    45-55s script budget every time the model added one."""
     return _TAG_IN_TEXT_RE.sub(" ", body).split()
 
 
@@ -342,7 +339,7 @@ def _ensure_delivery_tag(body: str) -> str:
     A prompt asks; a guard is what makes it true (the same reasoning as MAX_STYLE_TAGS in voice).
     [serious] is the one worth guaranteeing: the payoff line is both the emotional turn and the
     originality signal that carries the monetization gate (docs/08 §1), and it is the line most
-    damaged by being read in the same dry register as the joke before it.
+    damaged by being read in the same calm register as the story before it.
 
     Fail-soft and conservative: if the script already has any style tag, or the bridge cannot be
     located confidently, the body is returned UNCHANGED. A tag guessed into the wrong sentence
@@ -413,12 +410,12 @@ def write_script(idea: dict, template: str = "N") -> dict:
     key_points = ([str(p).strip() for p in kp if str(p).strip()][:5]
                   if isinstance(kp, list) else [])
 
-    max_words = int(config.get("SCRIPT_MAX_WORDS", "80"))
+    max_words = int(config.get("SCRIPT_MAX_WORDS", "135"))
     if len(_visible_words(body)) > max_words:
         log.warning("scriptwriter: idea %s script %d words > %d cap; truncating to a sentence.",
                     idea_id, len(_visible_words(body)), max_words)
         body = _truncate_to_words(body, max_words)
-    if len(_visible_words(body)) < 50:
+    if len(_visible_words(body)) < 80:
         log.warning("scriptwriter: idea %s script is short (%d words)",
                     idea_id, len(_visible_words(body)))
 
