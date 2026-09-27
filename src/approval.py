@@ -1,22 +1,7 @@
-"""Module 2 — Approval (Telegram Morning Digest).
-
-Contract:
-    what it does : sends the day's pending ideas to Telegram with Approve/Reject buttons;
-                   writes the operator's decision back to the ideas table.
-    how to use   : `send_digest()` to push; `process_responses()` to apply taps (polling).
-    depends on   : requests (Telegram Bot HTTP API), src.db, src.config.
-
-This is the ONLY human step (rule 16: keep the human approval layer). Each idea shows its
-source links so the operator can sanity-check (docs/08 §6). Three buttons: Approve (queue it),
-Reject (bad idea), Pass (soft skip — not posted, but not a hard reject). Soft-cap at
-APPROVAL_CAP (4-5) approvals to protect daily volume. We talk to the Bot HTTP API directly via
-requests — no async framework — which suits a short polling script run by the production workflow.
-
-Idempotency (rule 12): decisions write idea status; re-tapping just re-sets the same status.
-Security: callbacks from any chat other than TELEGRAM_CHAT_ID are ignored.
-"""
+"""Module 2 — Approval (Telegram Morning Digest)."""
 from __future__ import annotations
 
+import html
 import logging
 import os
 import time
@@ -80,21 +65,27 @@ def _format_sources(sources: list[str]) -> str:
     for s in sources:
         firsts.setdefault(_source_label(str(s)), str(s))
     if not firsts:
-        return "📰 no sources!"
+        return "📰 <b>no sources!</b>"
     shown = list(firsts.items())[:_SOURCES_SHOWN]
-    links = " · ".join(f"{label}" for label, u in shown)
+    links = " · ".join(
+        f'<a href="{html.escape(u, quote=True)}">{html.escape(label)}</a>'
+        for label, u in shown
+    )
     rest = len(sources) - len(shown)
-    return f"📰 {links}" + (f" +{rest} more" if rest > 0 else "")
+    return f"📰 {links}" + (f" <i>+{rest} more</i>" if rest > 0 else "")
 
 
 def _format_idea(idea: dict) -> str:
+    def esc(x):
+        return html.escape(str(x or ""))
+
     score = idea.get("est_score")
     score_str = f"{float(score):.2f}" if score is not None else "—"
     return (
-        f"{idea.get('title') or ''}\n\n"
-        f"Hook: {idea.get('hook') or ''}\n\n"
-        f"Why it matters: {idea.get('angle') or ''}\n\n"
-        f"Score: {score_str}  {_format_sources(idea.get('sources') or [])}"
+        f"<b>{esc(idea.get('title'))}</b>\n"
+        f"<i>Hook:</i> {esc(idea.get('hook'))}\n"
+        f"<i>Why it matters:</i> {esc(idea.get('angle'))}\n"
+        f"⭐ {score_str}  {_format_sources(idea.get('sources') or [])}"
     )
 
 
@@ -124,7 +115,11 @@ def send_digest() -> int:
     sent = 0
     for idea in ideas:
         text = _format_idea(idea)
+        # Telegram hard limit: 4096 chars. Truncate defensively.
+        if len(text) > 4000:
+            text = text[:4000] + "…"
         result = _api("sendMessage", chat_id=chat, text=text,
+                      parse_mode="HTML",
                       link_preview_options=_NO_PREVIEW,
                       reply_markup=_keyboard(idea["id"]))
         if result is None:
@@ -190,4 +185,4 @@ def process_responses(max_seconds: int = 600, poll_timeout: int = 25, cap: int |
             if _handle_update(up, cap) == "approved":
                 approved += 1
     log.info("approval: %d approved this run.", approved)
-    return approvedv
+    return approved
