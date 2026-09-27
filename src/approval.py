@@ -42,12 +42,11 @@ _DECISION_TEXT = {
 
 
 def _api(method: str, **params):
-    """Call a Telegram Bot API method; return its `result`. Raises on transport/API error."""
     url = _BASE.format(token=config.require("TELEGRAM_BOT_TOKEN"), method=method)
     resp = requests.post(url, json=params, timeout=_TIMEOUT)
     if resp.status_code >= 400:
         log.error("telegram API error: status=%s body=%s", resp.status_code, resp.text)
-        return None  # skip this idea instead of crashing the whole run
+        return None
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"telegram {method} failed: {data.get('description', data)}")
@@ -142,19 +141,22 @@ def _decided_message(label: str, msg: dict) -> dict:
 
 
 def send_digest() -> int:
-    """Send pending ideas as a Morning Digest with inline Approve/Reject buttons. Return #sent."""
     ideas = db.get_pending_ideas()
     if not ideas:
         log.info("approval: no pending ideas to send.")
         return 0
     chat = config.require("TELEGRAM_CHAT_ID")
     for idea in ideas:
-        body = _format_idea(idea)
-        log.info("approval: digest body for idea %s: %r", idea.get("id"), body)
-        plain = re.sub(r"<[^>]+>", "", body)
-        plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        _api("sendMessage", chat_id=chat, text=plain,
-             link_preview_options=_NO_PREVIEW, reply_markup=_keyboard(idea["id"]))
+        # Plain-text digest: no HTML, no parse_mode, no tag parsing errors
+        text = (
+            f"{idea.get('title', '')}\n\n"
+            f"Hook: {idea.get('hook', '')}\n\n"
+            f"Why it matters: {idea.get('angle', '')}\n\n"
+            f"Score: {idea.get('est_score', '—')}"
+        )
+        _api("sendMessage", chat_id=chat, text=text,
+             link_preview_options=_NO_PREVIEW,
+             reply_markup=_keyboard(idea["id"]))
     log.info("approval: sent %d ideas to the digest.", len(ideas))
     return len(ideas)
 
