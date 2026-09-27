@@ -30,6 +30,7 @@ jobs:
       # keys, so there is no credential to store — GitHub's OIDC token is exchanged for a short
       # lived one via Workload Identity Federation. `id-token: write` below is what mints it.
       - name: Authenticate to Google Cloud (keyless)
+        if: vars.GEMINI_USE_VERTEX == 'true'
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: projects/892249248253/locations/global/workloadIdentityPools/github/providers/github-oidc
