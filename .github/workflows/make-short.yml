@@ -59,7 +59,18 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+      - name: Debug Cloudflare config
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          VISUAL_SOURCE: ${{ vars.VISUAL_SOURCE }}
+        run: |
+          echo "VISUAL_SOURCE=[$VISUAL_SOURCE]"
+          echo "CF_API_TOKEN length=${#CF_API_TOKEN}"
+          echo "CF_API_TOKEN first 10 chars=${CF_API_TOKEN:0:10}"
+          echo "CF_API_TOKEN last 5 chars=${CF_API_TOKEN: -5}"
+          echo "CF_ACCOUNT_ID length=${#CF_ACCOUNT_ID}"
+          echo "CF_ACCOUNT_ID=[$CF_ACCOUNT_ID]"
       - name: Make a Short (on demand)
         env:                     # secrets configured in repo Settings -> Secrets (rule 5)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
