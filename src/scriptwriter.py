@@ -1,20 +1,21 @@
-"""Module 3 — Scriptwriter (History Documentary).
+"""Module 3 — Scriptwriter (Hindi Romance Storytelling).
 
 Contract:
-    what it does : turns an approved idea (+ its sources) into a script via a template.
-    input        : idea dict {id, title, hook, angle, sources, ...}; template name (default 'N').
-    output       : {script_id, script_body, caption, hashtags[]} — also written to `scripts`.
-    depends on   : src.llm, src.db, templates/*.md (design source), src.config.
+    what it does : turns an approved romance idea (+ its hook and angle) into a 2-3 minute
+                   Hindi narration.
+    input        : idea dict {id, title, hook, angle, ...}; template name (default 'N').
+    output       : {script_id, script_body, caption, hashtags[], title, tags, key_points}
+    depends on   : src.llm, src.db, src.config.
 
-ORIGINALITY IS THE MONETIZATION GATE (docs/08 §1): the script's core value is the
-"why it matters" ANALYSIS, not a summary. Rewrite facts in own words + cite. Caption must
-include source links + an AI-disclosure line. Keyword-rich title (SEO). Append #Shorts.
+WHAT CHANGED FROM THE NEWS/HISTORY VERSION:
+    - The story is FICTIONAL. There are no sources to verify, no facts to check.
+    - The narration is written in HINDI (Devanagari), not English.
+    - Length target is 400-500 words (2-3 minutes when spoken with pauses).
+    - The "why it matters" turn is emotional, not factual.
+    - Sources are always empty; the caption omits the source line.
+    - Delivery tags are [pause], [pause long], [serious], [whispers] — no [sarcastic].
 
-The compliance requirements (source links, AI-disclosure line, #Shorts) are enforced in
-code AFTER the LLM responds — never trusted to the model, because they gate monetization.
-
-TONE: cinematic, authoritative, and reflective — like a BBC documentary voiceover. The
-delivery tags are [serious], [curious], [whispers], [pause] — NOT sarcastic or deadpan.
+The compliance machinery for AI disclosure and #Shorts is preserved.
 """
 from __future__ import annotations
 
@@ -26,268 +27,131 @@ from src import config, db, llm
 
 log = logging.getLogger(__name__)
 
-# Minimal compliant disclosure (docs/08 §2). The primary disclosure is YouTube's
-# synthetic-content FLAG set on upload (publish_youtube); this short line is the discreet
-# description backup. Removing disclosure entirely risks forced labels + YPP suspension and
-# does NOT help reach (researched 2026-06-09), so we keep a minimal honest line.
-DISCLOSURE_LINE = "AI-generated narration; stock visuals."
+DISCLOSURE_LINE = "AI-generated narration; AI-generated visuals."
 
-# Only Template N is in the Phase-1 MVP (rule 9 / YAGNI). The others exist as docs.
 _SUPPORTED_TEMPLATES = ("N",)
 
-_PROMPT_N = """You are the lead documentary scriptwriter for a history channel — cinematic, \
-authoritative, and reflective narration for **45-55 SECOND** YouTube Shorts. Your voice is the \
-calm, knowing storyteller of a BBC or Ken Burns documentary: measured, vivid, and deeply human. \
-You make the past feel immediate and consequential without ever lecturing or sensationalizing. \
-No sarcasm, no jokes, no modern commentary — the story itself carries the weight.
+_PROMPT_N = """You are a Hindi/Urdu romance storyteller. Your job is to expand an approved \
+story idea into a 2-3 minute narration (400-500 words) that will be read aloud over anime-style \
+visuals. The story is FICTION — you are not verifying anything, you are telling a story.
 
-IDEA: {title}
-HOOK: {hook}
-ANGLE (the take to develop): {angle}
-SOURCES:
-{sources}
+STORY IDEA:
+Title: {title}
+Hook: {hook}
+Emotional core: {angle}
 
-WHAT WINS ON THIS CHANNEL: a single vivid moment or surprising truth that opens a window into \
-a larger historical story. Lead with a specific image, sound, or decision — not a summary. \
-The viewer should feel they are THERE, then understand why it still matters. Promise == payoff.
+WRITE THE NARRATION IN HINDI (Devanagari script). The title and metadata stay in English, \
+but the spoken narration must be in natural, warm Hindi as spoken in India — not formal \
+literary Hindi, not Sanskritized. Think of how a grandmother tells a story: simple words, \
+concrete images, short sentences.
 
-Write a **45-55 SECOND** narration — about **110-135 words** (aim for the FULL length; do not \
-cut it short). Structure it:
-1. VIVID OPENING (first ~3s): a specific moment, image, or decision that drops the viewer into \
-the story. No "in this video", no throat-clearing, no rhetorical questions.
-2. CONTEXT & TENSION (3-4 sentences): what was at stake, who was involved, what hung in the \
-balance — in your own words, accurate, with sensory detail.
-3. THE TURN (1-2 sentences): the consequence or revelation — "Here's why it matters..." — said \
-plainly and with weight.
-4. REFLECTIVE CLOSE: a final line that echoes the opening image and lands the legacy + 2-3 word \
-CTA. Fill the full 45-55 seconds — don't end early. Read it aloud to check the pacing.
+STRUCTURE (do not label these sections in the output — just write the story):
 
-WRITE FOR THE EAR: short punchy sentences, natural rhythm, deliberate pauses. Sound like a \
-documentary narrator — not an essay, not a news anchor, not a teacher. No hateful or personal \
-attacks; the historical record speaks for itself.
+1. OPENING (first ~10 seconds): Start with the hook exactly as given, or expand it with one \
+   sensory detail. Drop the listener into the scene. Use weather, an object, a sound, a gesture.
 
-DELIVERY DIRECTION (this is how it will be READ ALOUD):
-Write for the ear first. Short sentences, natural rhythm. Use "..." for a deliberate beat or \
-hesitation — it changes the timing on every voice engine.
-Then add AT LEAST 1 and AT MOST 3 delivery tags. The one that is REQUIRED is a tone tag on the \
-"why it matters" turn — that line is the whole point of the video, and read in the same calm \
-register as the story before it, it can fade into the background. The rest are optional:
-- [pause] or [pause long] for a beat before a revelation or the "why it matters" turn.
-- [serious] for the "why it matters" turn — this is the one that tells the audience you mean it.
-- [curious] on an opening image or question, [whispers] on a quiet, intimate aside, [pause] before \
-a name, date, or consequence lands.
-Tags are stage direction, never narration — never write a tag the sentence already says out \
-loud, and never open the script with one. Fewer is better: a tag on every line reads as noise. \
-The failure mode is a narrator who ANNOUNCES the gravity; restraint reads as confidence.
+2. THE MEETING / THE BEGINNING (30-40 seconds): Who are these people? How did they meet? \
+   What was the moment that started it all? One specific detail is worth more than three vague ones.
 
-ACCURACY (THE ONE HARD LINE): VERIFY the historical event actually happened (use the sources + \
-web search). State ONLY facts you can support. NEVER invent names, dates, quotes, figures, or \
-events. Sharpen the FRAMING, never fabricate the STORY — a made-up fact gets the channel struck \
-and demonetized. If the record is disputed, say so plainly.
+3. THE SEPARATION / THE CONFLICT (60-90 seconds): The heart of the story. What went wrong? \
+   A misunderstanding, a family objection, a train missed, a letter never sent, a promise \
+   broken by circumstance. This is the longest section — build the ache.
 
-TRUTH OVER NEUTRALITY: you are NOT required to be even-handed when the historical record points \
-one way. If the evidence is clear, say so — a well-sourced conclusion is not bias. But the trade \
-is strict: the sharper your verdict, the more certain its supporting facts must be. Every \
-load-bearing claim has to be something a viewer could check. An independent fact-check runs on \
-this script before it is voiced, and unsupported claims kill the reel — so do not reach for a \
-dramatic claim than your sources can carry.
+4. THE YEARS PASS (30-40 seconds): Time moves. Show the cost — what each person became \
+   while waiting or moving on. Small details of daily life carry the weight.
 
-ALSO produce, for the feed + discoverability:
-- "title": a clear, curiosity-driven YouTube title (<=70 chars) that is TRUE to the video — \
-front-loading the most interesting REAL word.
-- "caption": an ATTRACTIVE, high-retention YouTube description structured cleanly:
-  Line 1: A gripping curiosity hook with a relevant emoji (YouTube shows ~2 lines in-feed to make viewers click 'more').
-  Line 2: A 1-2 sentence compelling summary of why this matters + a comment trigger question (e.g., "💬 What surprised you most? Comment below!").
-  Line 3: The real source link(s).
-- "tags": 12-15 specific high-traffic search terms & long-tail phrases people type on YouTube \
-(topic, key figures, places, era, and close search intent synonyms). No '#'.
-- "key_points": 2-3 ULTRA-SHORT on-screen text cards (<=4 words each) — punchiest facts or dates.
+5. THE TURN / THE REVELATION (30-40 seconds): The emotional core from the idea is delivered \
+   here. This is the "why it matters" turn — but emotional, not factual. What did they \
+   finally understand? What was the truth all along?
 
-Return ONLY a JSON object, no markdown fences. Write every line break inside a string as the \
-two-character escape \\n — a raw newline inside a JSON string is invalid JSON:
-{{"title": "the honest, gripping title", "script_body": "the spoken narration", "caption": "emoji hook line first\\n\\nwhy it matters summary + 💬 comment question\\n\\nSources: ...", "hashtags": ["#keyword", "#Shorts"], "tags": ["high traffic search term", "long tail phrase"], "key_points": ["short card", "another"]}}
+6. THE CLOSE (10-15 seconds): End on an image, not an explanation. Leave the listener with \
+   a feeling they can carry. Then a brief call-to-action — "अगर यह कहानी आपको छू गई हो, तो \
+   अपनी कहानी कमेंट में बताइए।" or similar.
+
+WRITING RULES:
+- Every sentence must be under 25 words. Short sentences carry emotion better than long ones.
+- Use concrete details, not abstractions. "उसकी साड़ी का पीला रंग" beats "उसकी खूबसूरती".
+- Repeat a single image (the letter, the train, the sari) across sections to create resonance.
+- No dialogue tags like "उसने कहा" — let the emotion carry the exchange.
+- Do not moralize or explain. Show, then let it land.
+- NO: violence, communal/religious incitement, suicide, explicit content, exploitative tragedy.
+
+DELIVERY TAGS (AT LEAST 1, AT MOST 3 in the whole script):
+These are stage directions for the voice engine, not narration. Write them in square brackets \
+immediately before the line they affect.
+- [pause] for a beat before a revelation
+- [pause long] for a longer, heavier beat — use at most once
+- [serious] for the emotional turn (the "why it matters" moment)
+- [whispers] for a quiet, intimate line — use sparingly
+Never open the script with a tag. Never write a tag the sentence already says out loud.
+
+ALSO produce, in ENGLISH for the YouTube metadata:
+- "title": a YouTube title (<=70 chars) in English, honest to the story, front-loading the \
+   most gripping emotional word. This is the SEO title.
+- "caption": an English YouTube description, formatted as:
+   Line 1: An emotional hook with one emoji (this is what shows in-feed).
+   Line 2: A 1-2 sentence teaser + a comment question.
+   Do NOT include a sources line — this is fiction.
+- "hashtags": 5-8 English hashtags. Include #Shorts. Include romance/storytelling tags like \
+   #RomanceStory #HindiKahani #LoveStory #EmotionalStory.
+- "tags": 12-15 English YouTube search terms people would type for this kind of story.
+- "key_points": 2-3 ULTRA-SHORT English on-screen text cards (<=4 words each).
+
+Return ONLY a JSON object. Write every line break inside a string as the two-character \
+escape \\n — a raw newline inside a JSON string is invalid JSON:
+{{"title": "English SEO title", "script_body": "हिंदी में पूरी कहानी", "caption": "emoji hook\\n\\ntea ser + comment question", "hashtags": ["#Shorts", "#RomanceStory"], "tags": ["hindi love story", "emotional kahani"], "key_points": ["short card", "another"]}}
 """
 
 
 def _build_prompt(idea: dict, template: str) -> str:
-    if template != "N":  # only N is wired in MVP; guard keeps unsupported templates loud
+    if template != "N":
         raise ValueError(
-            f"unsupported template {template!r} (MVP supports {_SUPPORTED_TEMPLATES}); "
-            "see templates/ for the others (Phase 2)."
+            f"unsupported template {template!r} (MVP supports {_SUPPORTED_TEMPLATES});"
         )
-    sources = idea.get("sources") or []
-    sources_block = "\n".join(f"- {s}" for s in sources) or "- (none provided)"
-    prompt = _PROMPT_N.format(
+    return _PROMPT_N.format(
         title=idea.get("title", ""),
         hook=idea.get("hook", ""),
         angle=idea.get("angle", ""),
-        sources=sources_block,
     )
-    # The human "why it matters" take is the originality + anti-"AI-slop" signal (2026 policy).
-    if config.get_bool("ENABLE_HUMAN_ANGLE", True):
-        prompt += ("\n\nEMPHASIS: the \"why it matters\" analysis is the point of the video — make "
-                   "it a genuine, specific historical take, not a generic restatement.")
-    return prompt
 
 
 def _parse_llm_json(raw: str) -> dict:
-    """Extract the JSON object from the LLM reply (tolerant of fences / surrounding prose)."""
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"scriptwriter: no JSON object in LLM reply: {raw[:200]!r}")
-    return json.loads(raw[start : end + 1], strict=False)  # tolerate raw control chars in strings
+    return json.loads(raw[start : end + 1], strict=False)
 
 
 def _generate_script_json(prompt: str) -> dict:
-    """Write the script with live web-grounding (verifies facts), falling back to ungrounded
-    JSON mode if grounding is unavailable or returns unusable JSON. Accuracy guard for a public
-    channel — grounding lets the model catch a fabricated premise instead of repeating it.
-
-    ENABLE_GROUNDED_SCRIPT=false skips the grounded attempt entirely. It exists because this call
-    is one of the 7 a 3-reel run spends from the single 20/day grounded budget shared with
-    ideation and `factcheck.verify` (audit 2026-09-03) — and when that budget runs dry it is the
-    fact-check GATE that stops working. If one of the two has to go, the gate is worth more: it
-    re-verifies the finished script, so a fabricated premise is still caught downstream. Default
-    stays ON — this is a lever for a busy day, not a silent quality cut."""
-    if not config.get_bool("ENABLE_GROUNDED_SCRIPT", True):
-        log.info("scriptwriter: grounded write disabled; using ungrounded JSON mode.")
-        return _parse_llm_json(llm.generate(prompt, json=True, max_tokens=2048))
-    try:
-        data = _parse_llm_json(llm.generate_grounded(prompt, max_tokens=2048))
-        if (data.get("script_body") or "").strip():
-            return data
-    except Exception as e:  # noqa: BLE001 — grounded write is best-effort; fall back
-        log.warning("scriptwriter: grounded write unusable (%s); using ungrounded JSON mode", e)
-    return _parse_llm_json(llm.generate(prompt, json=True, max_tokens=2048))
-
-
-# A cheap free-API pass that scores the opening hook and, only if it's weak, sharpens the title +
-# opening for more scroll-stop — WITHOUT touching any fact (accuracy is the hard line). Fail-soft:
-# any error or a bad rewrite keeps the original. Toggle ENABLE_HOOK_JUDGE; threshold HOOK_MIN_SCORE.
-_PUNCHUP_PROMPT = """You are a world-class viral YouTube Shorts hook doctor. You make the first \
-3 seconds impossible to scroll past. Below is a Short's title and narration.
-
-TITLE: {title}
-NARRATION:
-{body}
-
-STEP 1 — Score the CURRENT opening line (the first ~3 seconds) from 1 to 10 on raw scroll-stopping \
-power: 10 = a vivid, curiosity-exploding hook nobody could scroll past; 1 = a flat, slow, \
-"explainer" intro.
-
-STEP 2 — Rewrite for stronger HONEST pull (only when the score is below 7, i.e. genuinely flat):
-- TITLE: a clear curiosity gap or real stakes, front-loading the most interesting TRUE word. It \
-must stay honest to the narration — never promise something the body doesn't deliver.
-- OPENING: replace the first 1-2 sentences with a stronger TRUE hook — the most vivid image or \
-surprising fact already in the script, or a real question the viewer needs answered. Keep the \
-rest of the narration.
-
-HARD RULE — DO NOT add, remove, or change any FACT, name, number, date, quote, statistic, or claim. \
-Every factual statement must stay exactly as true as the original. You may ONLY re-word, re-order, \
-and intensify the DELIVERY. Keep it a tight 45-55 SECOND bite (~110-135 words) — sharpen wording \
-but NEVER lengthen it — and keep the closing CTA / loop-back line.
-
-OUTPUT — return ONE valid JSON object and NOTHING else. No markdown, no code fences, no commentary:
-{{"hook_score": 7, "title": "the punchier title", "script_body": "the full narration with a punchier opening"}}
-"""
-
-
-def _punch_up_hook(title: str, body: str) -> tuple[str, str]:
-    """Optionally sharpen a weak hook+title via a cheap LLM pass. Returns (title, body).
-
-    Best-effort (rule 11/14): on any failure, a high score, or an invalid rewrite, returns the
-    originals unchanged. Never adds facts — the prompt forbids it and the sources/caption are
-    untouched, so monetization compliance is unaffected."""
-    if not body.strip():
-        return title, body
-    try:
-        # prefer_groq: this is a no-web creative task → keep Gemini's scarce RPD for grounded
-        # research (rule 13). Groq's llama-3.3-70b handles punch-up copy at least as well.
-        data = _parse_llm_json(
-            llm.generate(_PUNCHUP_PROMPT.format(title=title, body=body),
-                         json=True, max_tokens=2048, prefer_groq=True)
-        )
-    except Exception as e:  # noqa: BLE001 — punch-up is optional; keep the original on any error
-        log.warning("scriptwriter: hook punch-up failed (%s); keeping original.", e)
-        return title, body
-
-    try:
-        score = int(float(data.get("hook_score", 0)))
-    except (TypeError, ValueError):
-        score = 0
-    if score >= int(config.get("HOOK_MIN_SCORE", "7")):
-        log.info("scriptwriter: hook already strong (score %d); not rewriting.", score)
-        return title, body
-
-    new_body = (data.get("script_body") or "").strip()
-    new_title = (data.get("title") or "").strip()
-    max_words = int(config.get("SCRIPT_MAX_WORDS", "135"))
-    if new_body and 80 <= len(_visible_words(new_body)) <= max_words:  # accept only if it stayed short
-        log.info("scriptwriter: punched up a weak hook (score %d).", score)
-        return (new_title or title), new_body
-    log.info("scriptwriter: punch-up rewrite unusable (score %d); keeping original.", score)
-    return title, body
-
-
-# Delivery tags must be matched against the WHOLE string, not token-by-token: "[pause long]"
-# contains a space, so splitting on whitespace yields "[pause" and "long]" and a per-token test
-# counts BOTH as spoken words.
-_TAG_IN_TEXT_RE = re.compile(r"\[[^\]]*\]")
-# A tag, or a run of non-space that does not start a tag (so "three.[pause]" splits cleanly).
-_PIECE_RE = re.compile(r"\[[^\]]*\]|[^\s\[]+")
+    """Write the script with ungrounded JSON mode. The story is fiction — no grounded search
+    is used, and no source verification happens."""
+    return _parse_llm_json(llm.generate(prompt, json=True, max_tokens=4096))
 
 
 def _visible_words(body: str) -> list[str]:
-    """Words the narrator actually SAYS — inline delivery tags ([pause], [serious]) are stage
-    direction for the TTS engine, not narration. Counting them would silently shrink the
-    45-55s script budget every time the model added one."""
-    return _TAG_IN_TEXT_RE.sub(" ", body).split()
+    """Words the narrator actually says — delivery tags are stage direction, not narration."""
+    return re.sub(r"\[[^\]]*\]", " ", body).split()
 
 
-def _payoff_start(body: str) -> int | None:
-    """Index where the 'why it matters' sentence begins, or None if there is no bridge.
+def _ensure_shorts(hashtags: list[str]) -> list[str]:
+    if any(h.lower() == "#shorts" for h in hashtags):
+        return hashtags
+    return [*hashtags, "#Shorts"]
 
-    Shared by the tag floor and the length cap so the two agree on WHERE the payoff is; two
-    copies of this walk-back drifting apart is how [curious] came to be emitted-but-stripped.
-    """
-    m = _WHY_IT_MATTERS_RE.search(body)
-    if not m:
-        return None
-    starts = [e.end() for e in _SENTENCE_END_RE.finditer(body, 0, m.start())]
-    return starts[-1] if starts else 0
+
+def _ensure_disclosure(caption: str) -> str:
+    if "ai-generated" in caption.lower():
+        return caption
+    return f"{caption.rstrip()}\n{DISCLOSURE_LINE}" if caption.strip() else DISCLOSURE_LINE
 
 
 def _truncate_to_words(body: str, max_words: int) -> str:
-    """Hard length backstop: if the body exceeds max_words, cut to the last full sentence
-    at or under the cap (so we never end mid-thought). Deterministic.
-
-    Delivery tags are carried through and do not count toward the cap.
-
-    The cap trims from the END, which is precisely where the 'why it matters' turn lives — so
-    a long script was silently losing its payoff. Observed live on idea 224 (run 32920283763):
-    `104 words > 80 cap; truncating to a sentence.` and then, next line, `has NO 'why it
-    matters' turn`. The truncation caused the warning. That turn is the originality signal the
-    monetization gate turns on (docs/08 §1), which makes it the most expensive sentence in the
-    script to drop, not the cheapest. So when a bridge exists it is RESERVED: the setup is
-    trimmed to whatever budget is left after the payoff is paid for.
-    """
+    """Trim to the last full sentence at or under the cap. Delivery tags are carried through
+    and do not count toward the cap."""
     if len(_visible_words(body)) <= max_words:
         return body
-
-    start = _payoff_start(body)
-    if start is not None:
-        payoff = body[start:].strip()
-        payoff_words = len(_visible_words(payoff))
-        # Only reserve it if the setup still gets a meaningful share; a payoff that alone blows
-        # the cap means the writer wrote one enormous closing sentence, and the old
-        # keep-the-front behaviour degrades better than emitting the payoff by itself.
-        if 0 < payoff_words < max_words:
-            head = _truncate_to_words(body[:start].strip(), max_words - payoff_words)
-            return f"{head} {payoff}".strip() if head else payoff
-
     kept, spoken = [], 0
-    for m in _PIECE_RE.finditer(body):
-        piece = m.group(0)
+    for piece in re.findall(r"\[[^\]]*\]|[^\s\[]+", body):
         if piece.startswith("[") and piece.endswith("]"):
             kept.append(piece)
             continue
@@ -296,88 +160,12 @@ def _truncate_to_words(body: str, max_words: int) -> str:
         kept.append(piece)
         spoken += 1
     truncated = " ".join(kept)
-    ends = list(re.finditer(r"[.!?]", truncated))
+    ends = list(re.finditer(r"[.!?।]", truncated))
     return (truncated[: ends[-1].end()] if ends else truncated).strip()
 
 
-def _ensure_sources(caption: str, sources: list[str]) -> str:
-    """Guarantee every source URL is present in the caption (copyright/sourcing gate)."""
-    missing = [s for s in sources if s and s not in caption]
-    if not missing:
-        return caption
-    # One per line, not " | "-joined: since the 2026-09-03 sourcing fix these are Google News
-    # article links, measured at 249-884 chars each, so a joined pair is an unreadable wall in
-    # the YouTube description.
-    block = "Sources:" + "".join("\n" + m for m in missing)
-    return f"{caption.rstrip()}\n\n{block}" if caption.strip() else block
-
-
-def _ensure_disclosure(caption: str) -> str:
-    """Guarantee the AI-disclosure line is present (docs/08 §2 — required)."""
-    if "ai-generated" in caption.lower():
-        return caption
-    return f"{caption.rstrip()}\n{DISCLOSURE_LINE}" if caption.strip() else DISCLOSURE_LINE
-
-
-# The retention bridge the prompt asks for ("Here's why it actually matters…"). Matching it is
-# how the floor knows WHERE the payoff starts — the tag is worthless in the wrong place.
-_WHY_IT_MATTERS_RE = re.compile(
-    r"(?i)\b(here'?s why\b|why (?:it|this)(?: actually)? matters\b"
-    r"|(?:it|this) (?:actually )?matters because\b|the real (?:point|issue) (?:here )?is\b)")
-# Sentence boundary: terminator + whitespace. Used to walk BACK to the start of the sentence the
-# bridge lives in, so the tag lands on the whole payoff rather than mid-clause.
-_SENTENCE_END_RE = re.compile(r"[.!?…](?:[\"')\]]*)\s+")
-
-
-def _ensure_delivery_tag(body: str) -> str:
-    """Guarantee the script carries at least one delivery tag, on the 'why it matters' turn.
-
-    Measured 2026-08-07 against the last 5 produced scripts: two of them shipped with NO tags at
-    all. The prompt says "AT MOST 3 … fewer is better", which permits zero — so on a channel whose
-    whole premise is the delivery, ~40% of reels went out with no direction on the read.
-
-    A prompt asks; a guard is what makes it true (the same reasoning as MAX_STYLE_TAGS in voice).
-    [serious] is the one worth guaranteeing: the payoff line is both the emotional turn and the
-    originality signal that carries the monetization gate (docs/08 §1), and it is the line most
-    damaged by being read in the same calm register as the story before it.
-
-    Fail-soft and conservative: if the script already has any style tag, or the bridge cannot be
-    located confidently, the body is returned UNCHANGED. A tag guessed into the wrong sentence
-    would be worse than no tag.
-    """
-    from src import voice  # local import: keeps the tag allow-list in ONE module (rule 7)
-
-    if not config.get_bool("ENABLE_TAG_FLOOR", True) or voice.has_style_tag(body):
-        return body
-
-    m = _WHY_IT_MATTERS_RE.search(body)
-    if not m:
-        log.info("scriptwriter: no delivery tag and no 'why it matters' bridge found; "
-                 "leaving the script untagged rather than guessing a placement.")
-        return body
-
-    # Walk back to the start of the sentence containing the bridge.
-    starts = [e.end() for e in _SENTENCE_END_RE.finditer(body, 0, m.start())]
-    at = starts[-1] if starts else 0
-    log.info("scriptwriter: script had no delivery tag; inserted [serious] on the payoff turn.")
-    return f"{body[:at]}[serious] {body[at:]}".strip()
-
-
-def _ensure_shorts(hashtags: list[str]) -> list[str]:
-    """Guarantee #Shorts is present (YouTube classifies the upload as a Short)."""
-    if any(h.lower() == "#shorts" for h in hashtags):
-        return hashtags
-    return [*hashtags, "#Shorts"]
-
-
 def write_script(idea: dict, template: str = "N") -> dict:
-    """Generate {script_body, caption, hashtags[]} for an approved idea and persist it.
-
-    Returns the same dict plus the new `script_id`. Raises ValueError if the LLM reply
-    can't be parsed into a non-empty script (caller skips that one reel — rule 14: soft on
-    runtime). Compliance fields (sources, disclosure, #Shorts) are enforced here, not trusted
-    to the model.
-    """
+    """Generate {script_body, caption, hashtags[]} for an approved idea and persist it."""
     idea_id = idea.get("id")
     if idea_id is None:
         raise ValueError("scriptwriter: idea has no 'id' (must be a persisted ideas row).")
@@ -388,54 +176,31 @@ def write_script(idea: dict, template: str = "N") -> dict:
     if not body:
         raise ValueError(f"scriptwriter: empty script_body for idea {idea_id}.")
 
-    # SEO extras (used by publish for title + tags; fall back to the idea title downstream).
     title = (data.get("title") or "").strip()
-
-    # Scroll-stop judge: punch up a weak hook+title before we spend a render (fail-soft, no new facts).
-    if config.get_bool("ENABLE_HOOK_JUDGE", True):
-        title, body = _punch_up_hook(title, body)
 
     hashtags = data.get("hashtags")
     if not isinstance(hashtags, list):
         hashtags = []
     hashtags = _ensure_shorts([str(h) for h in hashtags])
 
-    caption = _ensure_disclosure(_ensure_sources(data.get("caption") or "", idea.get("sources") or []))
+    caption = _ensure_disclosure(data.get("caption") or "")
 
     tags = data.get("tags")
     tags = [str(t).lstrip("#").strip() for t in tags if str(t).strip()] if isinstance(tags, list) else []
 
-    # Short on-screen text cards (story-specific visuals, burned by subtitles over the B-roll).
     kp = data.get("key_points")
     key_points = ([str(p).strip() for p in kp if str(p).strip()][:5]
                   if isinstance(kp, list) else [])
 
-    max_words = int(config.get("SCRIPT_MAX_WORDS", "135"))
+    max_words = int(config.get("SCRIPT_MAX_WORDS", "550"))
     if len(_visible_words(body)) > max_words:
-        log.warning("scriptwriter: idea %s script %d words > %d cap; truncating to a sentence.",
+        log.warning("scriptwriter: idea %s script %d words > %d cap; truncating.",
                     idea_id, len(_visible_words(body)), max_words)
         body = _truncate_to_words(body, max_words)
-    if len(_visible_words(body)) < 80:
-        log.warning("scriptwriter: idea %s script is short (%d words)",
+    if len(_visible_words(body)) < 350:
+        log.warning("scriptwriter: idea %s script is short (%d words); a 2-min story needs ~400.",
                     idea_id, len(_visible_words(body)))
 
-    # ORIGINALITY SIGNAL, not a style nit (docs/08 §1). A script with no "why it matters" turn is
-    # a bare summary, which is exactly what YouTube's inauthentic-content policy demotes and what
-    # the monetization gate turns on. Found live on script 158 (2026-08-07), where it was
-    # invisible because nothing checked. Warn rather than block: accuracy already has a hard gate
-    # (factcheck), and stacking a second blocking gate on a SOFT quality judgement would cost
-    # reels for something a human should eyeball (rule 14 — soft on runtime).
-    if not _WHY_IT_MATTERS_RE.search(body):
-        log.warning("scriptwriter: idea %s has NO 'why it matters' turn — that makes it a bare "
-                    "summary, which is the originality/monetization risk (docs/08 §1). Review it.",
-                    idea_id)
-
-    # After the word cap, so truncation can never cut the tag back off. Tags are not spoken
-    # words (_visible_words ignores them), so this cannot push the script over the cap.
-    body = _ensure_delivery_tag(body)
-
-    # Persist the published title too, so the analytics loop can learn which title STYLE wins
-    # (db.top_performing_titles) — the dry idea title is a poor proxy for what viewers tapped.
     script_id = db.insert_script(idea_id, template, body, caption, hashtags, title or None)
     return {"script_id": script_id, "script_body": body, "caption": caption,
             "hashtags": hashtags, "title": title, "tags": tags, "key_points": key_points}
