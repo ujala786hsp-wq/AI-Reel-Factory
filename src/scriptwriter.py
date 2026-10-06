@@ -1,21 +1,16 @@
-"""Module 3 — Scriptwriter (Hindi Romance Storytelling).
+"""Module 3 — Scriptwriter (English Romance Storytelling).
 
 Contract:
-    what it does : turns an approved romance idea (+ its hook and angle) into a 2-3 minute
-                   Hindi narration.
+    what it does : turns an approved romance idea (+ its hook and angle) into a 60-second
+                   English narration.
     input        : idea dict {id, title, hook, angle, ...}; template name (default 'N').
     output       : {script_id, script_body, caption, hashtags[], title, tags, key_points}
     depends on   : src.llm, src.db, src.config.
 
-WHAT CHANGED FROM THE NEWS/HISTORY VERSION:
-    - The story is FICTIONAL. There are no sources to verify, no facts to check.
-    - The narration is written in HINDI (Devanagari), not English.
-    - Length target is 400-500 words (2-3 minutes when spoken with pauses).
-    - The "why it matters" turn is emotional, not factual.
-    - Sources are always empty; the caption omits the source line.
-    - Delivery tags are [pause], [pause long], [serious], [whispers] — no [sarcastic].
-
-The compliance machinery for AI disclosure and #Shorts is preserved.
+The story is FICTION — no sources to verify, no facts to check. English narration is used
+because the free-tier Hindi TTS engines (Chirp 3 HD) require Google Cloud billing, and the
+fallback engines (Kokoro, edge-tts) produce unintelligible Hindi. English works on every
+engine without any credentials.
 """
 from __future__ import annotations
 
@@ -31,75 +26,67 @@ DISCLOSURE_LINE = "AI-generated narration; AI-generated visuals."
 
 _SUPPORTED_TEMPLATES = ("N",)
 
-_PROMPT_N = """You are a Hindi/Urdu romance storyteller. Your job is to expand an approved \
-story idea into a 2-3 minute narration (400-500 words) that will be read aloud over anime-style \
-visuals. The story is FICTION — you are not verifying anything, you are telling a story.
+_PROMPT_N = """You are a cinematic romance storyteller. Your job is to expand an approved \
+story idea into a tight ~60 second narration (~150-180 words) that will be read aloud over \
+anime-style visuals. The story is FICTION — you are not verifying anything, you are telling \
+a story.
 
 STORY IDEA:
 Title: {title}
 Hook: {hook}
 Emotional core: {angle}
 
-WRITE THE NARRATION IN HINDI (Devanagari script). The title and metadata stay in English, \
-but the spoken narration must be in natural, warm Hindi as spoken in India — not formal \
-literary Hindi, not Sanskritized. Think of how a grandmother tells a story: simple words, \
-concrete images, short sentences.
+WRITE THE NARRATION IN ENGLISH. Natural, warm, cinematic English as spoken by a storyteller — \
+not literary, not formal, not AI-sounding. Think of how a grandmother tells a story: simple \
+words, concrete images, short sentences. Contractions are fine. No thesaurus words.
 
 STRUCTURE (do not label these sections in the output — just write the story):
 
-1. OPENING (first ~10 seconds): Start with the hook exactly as given, or expand it with one \
+1. OPENING (first 3-5 seconds): Start with the hook exactly as given, or expand it with one \
    sensory detail. Drop the listener into the scene. Use weather, an object, a sound, a gesture.
 
-2. THE MEETING / THE BEGINNING (30-40 seconds): Who are these people? How did they meet? \
-   What was the moment that started it all? One specific detail is worth more than three vague ones.
+2. THE HEART (20-30 seconds): What happened between these people? One specific moment is worth \
+   more than three vague ones. Show the ache — not the summary.
 
-3. THE SEPARATION / THE CONFLICT (60-90 seconds): The heart of the story. What went wrong? \
-   A misunderstanding, a family objection, a train missed, a letter never sent, a promise \
-   broken by circumstance. This is the longest section — build the ache.
+3. THE TURN (10-15 seconds): The emotional core from the idea lands here. What did they finally \
+   understand? What was the truth all along?
 
-4. THE YEARS PASS (30-40 seconds): Time moves. Show the cost — what each person became \
-   while waiting or moving on. Small details of daily life carry the weight.
-
-5. THE TURN / THE REVELATION (30-40 seconds): The emotional core from the idea is delivered \
-   here. This is the "why it matters" turn — but emotional, not factual. What did they \
-   finally understand? What was the truth all along?
-
-6. THE CLOSE (10-15 seconds): End on an image, not an explanation. Leave the listener with \
-   a feeling they can carry. Then a brief call-to-action — "अगर यह कहानी आपको छू गई हो, तो \
-   अपनी कहानी कमेंट में बताइए।" or similar.
+4. THE CLOSE (5-8 seconds): End on an image, not an explanation. Leave the listener with a \
+   feeling. Then a brief call to action like "If this story touched you, tell me yours in the \
+   comments."
 
 WRITING RULES:
-- Every sentence must be under 25 words. Short sentences carry emotion better than long ones.
-- Use concrete details, not abstractions. "उसकी साड़ी का पीला रंग" beats "उसकी खूबसूरती".
-- Repeat a single image (the letter, the train, the sari) across sections to create resonance.
-- No dialogue tags like "उसने कहा" — let the emotion carry the exchange.
+- Every sentence under 20 words. Short sentences carry emotion better than long ones.
+- Concrete details, not abstractions. "The yellow of her saree" beats "her beauty".
+- Repeat a single image (the letter, the train, the saree) across sections for resonance.
+- No dialogue tags like "she said" — let the emotion carry the exchange.
 - Do not moralize or explain. Show, then let it land.
-- NO: violence, communal/religious incitement, suicide, explicit content, exploitative tragedy.
+- NO: violence, communal or religious incitement, suicide, explicit content, exploitative tragedy.
 
 DELIVERY TAGS (AT LEAST 1, AT MOST 3 in the whole script):
 These are stage directions for the voice engine, not narration. Write them in square brackets \
 immediately before the line they affect.
 - [pause] for a beat before a revelation
 - [pause long] for a longer, heavier beat — use at most once
-- [serious] for the emotional turn (the "why it matters" moment)
+- [serious] for the emotional turn
 - [whispers] for a quiet, intimate line — use sparingly
 Never open the script with a tag. Never write a tag the sentence already says out loud.
 
-ALSO produce, in ENGLISH for the YouTube metadata:
-- "title": a YouTube title (<=70 chars) in English, honest to the story, front-loading the \
-   most gripping emotional word. This is the SEO title.
+ALSO produce, for the YouTube metadata (all English):
+- "title": a YouTube title (<=70 chars), honest to the story, front-loading the most gripping \
+   emotional word.
 - "caption": an English YouTube description, formatted as:
-   Line 1: An emotional hook with one emoji (this is what shows in-feed).
+   Line 1: An emotional hook with one emoji.
    Line 2: A 1-2 sentence teaser + a comment question.
    Do NOT include a sources line — this is fiction.
 - "hashtags": 5-8 English hashtags. Include #Shorts. Include romance/storytelling tags like \
-   #RomanceStory #HindiKahani #LoveStory #EmotionalStory.
+   #RomanceStory #LoveStory #EmotionalStory #Storytime.
 - "tags": 12-15 English YouTube search terms people would type for this kind of story.
 - "key_points": 2-3 ULTRA-SHORT English on-screen text cards (<=4 words each).
 
 Return ONLY a JSON object. Write every line break inside a string as the two-character \
 escape \\n — a raw newline inside a JSON string is invalid JSON:
-{{"title": "English SEO title", "script_body": "हिंदी में पूरी कहानी", "caption": "emoji hook\\n\\ntea ser + comment question", "hashtags": ["#Shorts", "#RomanceStory"], "tags": ["hindi love story", "emotional kahani"], "key_points": ["short card", "another"]}}
+{{"title": "English SEO title", "script_body": "the full English story", "caption": "emoji hook\\n\\nteaser + comment question", "hashtags": ["#Shorts", "#RomanceStory"], "tags": ["emotional love story", "storytime romance"], "key_points": ["short card", "another"]}}
 """
 
 
@@ -160,7 +147,7 @@ def _truncate_to_words(body: str, max_words: int) -> str:
         kept.append(piece)
         spoken += 1
     truncated = " ".join(kept)
-    ends = list(re.finditer(r"[.!?।]", truncated))
+    ends = list(re.finditer(r"[.!?]", truncated))
     return (truncated[: ends[-1].end()] if ends else truncated).strip()
 
 
@@ -192,13 +179,13 @@ def write_script(idea: dict, template: str = "N") -> dict:
     key_points = ([str(p).strip() for p in kp if str(p).strip()][:5]
                   if isinstance(kp, list) else [])
 
-    max_words = int(config.get("SCRIPT_MAX_WORDS", "550"))
+    max_words = int(config.get("SCRIPT_MAX_WORDS", "200"))
     if len(_visible_words(body)) > max_words:
         log.warning("scriptwriter: idea %s script %d words > %d cap; truncating.",
                     idea_id, len(_visible_words(body)), max_words)
         body = _truncate_to_words(body, max_words)
-    if len(_visible_words(body)) < 350:
-        log.warning("scriptwriter: idea %s script is short (%d words); a 2-min story needs ~400.",
+    if len(_visible_words(body)) < 120:
+        log.warning("scriptwriter: idea %s script is short (%d words); a 60s story needs ~150.",
                     idea_id, len(_visible_words(body)))
 
     script_id = db.insert_script(idea_id, template, body, caption, hashtags, title or None)
