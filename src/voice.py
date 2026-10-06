@@ -8,31 +8,21 @@ Contract:
                    (rule 11: every engine has a fallback behind it).
 
 Default engine is **Gemini TTS** on the free `gemini-3.1-flash-tts-preview` model, voice
-**Zubenelgenubi** ("Casual") — chosen by ear because it carries dry sarcasm, which is the
-channel's whole register. The model was picked the same way on 2026-08-07: the operator ranked
-3.1-flash > 2.5-flash > Chirp on an identical script. That ranking is also the order this module
-degrades in, which is the only reason a *preview* model is safe as the default — a 503 lands on
-the second-favourite sound, not on a surprise. The chain then falls through to Chirp 3 HD,
-edge-tts and Kokoro, resolved by name at call time so a missing key or a withdrawn preview model
-just advances a link. Pick the primary via VOICE_ENGINE (gemini|google|edge|kokoro).
+**Zubenelgenubi** ("Casual"). The chain then falls through to Chirp 3 HD, edge-tts and Kokoro,
+resolved by name at call time so a missing key or a withdrawn preview model just advances a link.
+Pick the primary via VOICE_ENGINE (gemini|google|edge|kokoro).
 
-**Expressive delivery is per-engine**, because the control signals are not portable:
-  · `gemini`  — promptable: honours VOICE_STYLE_PROMPT *and* inline style tags ([sarcastic]).
-                Free tier is metered per model: 3 RPM / 10 RPD (measured 2026-07-27), so it
-                cannot starve the grounded ideation that shares the same API key.
-  · `google`  — Chirp 3 HD reads `[pause]` tags, but only through its `markup` input field,
-                and supports GOOGLE_TTS_SPEAKING_RATE.
-  · `edge`/`kokoro` — no tag support at all; every tag is stripped before synthesis.
-So each engine filters the script body itself rather than being handed pre-stripped text.
+**Expressive delivery is per-engine**:
+  · `gemini`  — promptable: honours VOICE_STYLE_PROMPT and inline style tags.
+  · `google`  — Chirp 3 HD reads `[pause]` tags through its `markup` input field.
+  · `edge`/`kokoro` — no tag support; every tag is stripped before synthesis.
 
-Kokoro's int8 model (~120 MB) auto-downloads once to KOKORO_CACHE; its voice/speed come from
-KOKORO_VOICE/KOKORO_SPEED, edge-tts from VOICE/VOICE_RATE.
-
-The local file is a render artifact: produce it here, let assembly/publish consume it, then
-delete it (rule 15 — never store video/audio in Supabase).
+**The edge-tts stream now has a 60-second timeout** so a hanging network call can no longer
+stall the entire GitHub Actions run.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -47,76 +37,47 @@ from src import config
 
 log = logging.getLogger(__name__)
 
-# Split on sentence enders (incl. ellipsis) so dramatic pacing can put a beat between sentences.
 _SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
 
-# edge-tts (fallback engine)
-# The channel has ONE narrator. Every link in the chain must sound like the same person, or a
-# transient outage silently swaps who is presenting the news mid-catalogue. STATUS 2026-08-25
-# recorded this as fixed ("keep one narrator down the whole voice fallback chain") but only
-# changed the Chirp link; edge-tts still defaulted to Neerja (female) under a male primary
-# (Gemini Zubenelgenubi), and Kokoro to af_heart (American female). Prabhat is the male en-IN
-# edge voice; see _KOKORO_DEFAULT_VOICE for the Kokoro end of the same fix.
 _VOICE = config.get("VOICE", "en-IN-PrabhatNeural")
 _RATE = config.get("VOICE_RATE", "+0%")
-_TICKS_PER_SECOND = 1e7  # edge-tts offsets/durations are in 100-nanosecond ticks
+_TICKS_PER_SECOND = 1e7
 
-# Kokoro (primary engine) — int8 ONNX model files from the kokoro-onnx release.
 _KOKORO_BASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
 _KOKORO_MODEL = "kokoro-v1.0.int8.onnx"
 _KOKORO_VOICES = "voices-v1.0.bin"
 
-# Google Cloud TTS (primary engine) — Chirp 3 HD via the v1 REST endpoint + API key (headless).
 _GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
-# Gemini Developer API TTS returns raw PCM at this rate (16-bit mono, no container).
 _GEMINI_TTS_RATE = 24000
-# Documented request limits: text and prompt <=4000 bytes each, <=8000 bytes combined.
 _GEMINI_MAX_FIELD_BYTES = 4000
 _GEMINI_MAX_TOTAL_BYTES = 8000
-# The channel voice, chosen by ear 2026-08-07: the operator A/B'd all three and ranked
-# 3.1-flash > 2.5-flash > Chirp. That ranking happens to BE the fallback order, which is what
-# makes promoting a preview model safe here — every way this degrades lands on the next-preferred
-# sound, never on a worse-than-expected one.
 _GEMINI_TTS_PRIMARY = "gemini-3.1-flash-tts-preview"
-# The in-engine safety net for GEMINI_TTS_MODEL. Every Gemini TTS model is still labelled preview,
-# so the configured one can be transiently unavailable — and the primary above genuinely is:
-# measured 2026-08-07 it returned 503 "high demand" on 3 of 4 attempts. This one is the model
-# measured reliably up and free on both input and output. Only used when it is not already the
-# choice, so the default path costs exactly one request, not two.
 _GEMINI_TTS_STABLE = "gemini-2.5-flash-preview-tts"
-# Retryable upstream states: capacity/outage, not "your request is wrong". A 429 is deliberately
-# NOT here — out of quota means the next model shares the same daily reset, so re-asking just
-# burns time before the engine chain does its job (rules 11, 13).
 _TRANSIENT_MARKERS = ("503", "unavailable", "500", "internal", "504", "deadline", "overloaded")
+
+# Timeout for the whole edge-tts stream, in seconds. If Microsoft's endpoint stalls, this
+# raises instead of hanging forever.
+_EDGE_TIMEOUT = 60.0
 
 
 def _is_transient(exc: Exception) -> bool:
-    """True if `exc` looks like an upstream blip worth trying another model for."""
     return any(m in str(exc).lower() for m in _TRANSIENT_MARKERS)
-# Structured per Google's own style-prompt guidance: an audio profile, then director's notes on
-# pacing and inflection, then paralinguistic detail. Their docs are explicit that naming an
-# emotion ("sarcastic") underperforms describing what it SOUNDS like -- and for this channel the
-# failure mode is a narrator who announces the joke, so most of this prompt is restraint.
+
+
 _DEFAULT_STYLE_PROMPT = (
-    "You are a sharp, faintly unimpressed news explainer talking to one friend, not an audience. "
-    "Read at a brisk clip with crisp consonants and very little warmth. "
-    "Deliver the setup flat and factual; let the dry amusement sit UNDER the words rather than on "
-    "top of them, and never announce the joke. Understate the punchline instead of leaning into "
-    "it, with a slight downward inflection at the end of each sentence. "
-    "Read the final line completely straight, as though it plainly matters."
+    "You are a warm, cinematic storyteller narrating an emotional Hindi romance story. "
+    "Speak slowly and clearly, with deliberate pauses before the emotional turns. "
+    "Let the words carry the feeling — never rush the ending."
 )
 
 
 def _audio_filename(script_body: str, ext: str = ".mp3") -> str:
-    """Deterministic name from the script text → reruns overwrite, never duplicate (rule 12)."""
     digest = hashlib.sha1(script_body.encode("utf-8")).hexdigest()[:12]
     return f"narration_{digest}{ext}"
 
 
 def _download(url: str, dest: str) -> None:
-    import requests
-
     with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
@@ -126,7 +87,6 @@ def _download(url: str, dest: str) -> None:
 
 
 def _ensure_kokoro_models() -> tuple[str, str]:
-    """Return (model_path, voices_path), downloading the int8 model once if missing."""
     cache = config.get("KOKORO_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "kokoro"))
     os.makedirs(cache, exist_ok=True)
     paths = []
@@ -141,43 +101,24 @@ def _ensure_kokoro_models() -> tuple[str, str]:
 
 @lru_cache(maxsize=1)
 def _kokoro():
-    """Load (once) the Kokoro ONNX model. Imported lazily so edge-only setups don't need it."""
     from kokoro_onnx import Kokoro
-
     model, voices = _ensure_kokoro_models()
     return Kokoro(model, voices)
 
 
-# Kokoro's naming encodes gender: af_* / bf_* are female, am_* / bm_* male. `af_heart` was the
-# last link still contradicting the channel's male narrator (see _VOICE above). Kokoro has no
-# Indian English voice, so a neutral male read is the closest match to Zubenelgenubi.
 _KOKORO_DEFAULT_VOICE = "am_michael"
 
 
 def _kokoro_voice() -> str:
-    """The Kokoro narrator. Public-ish so the one-narrator rule is testable (rule 8)."""
     return config.get("KOKORO_VOICE", _KOKORO_DEFAULT_VOICE)
 
 
 def _split_sentences(text: str) -> list[str]:
-    """Split narration into sentences for dramatic pacing. Always ≥1 item for non-empty input."""
     return [s.strip() for s in _SENTENCE_RE.split(text.strip()) if s.strip()]
 
 
 def _synthesize_kokoro(text: str, out_path: str) -> float:
-    """Write a WAV via Kokoro; return measured duration (s). Raises if no audio.
-
-    NOTE: Kokoro is the LAST link in the chain now, so ENABLE_DRAMATIC_PACING only takes effect
-    if gemini, Chirp AND edge-tts have all failed. Timing on the primary path comes from the
-    scriptwriter's pause tags and ellipses instead.
-
-    With dramatic pacing on (ENABLE_DRAMATIC_PACING, default), each sentence is synthesized
-    separately and joined with a short silence — a LONGER beat before the final payoff line — so
-    the delivery breathes and lands the punchline instead of running on. Kokoro returns raw
-    samples, so this is exact, in-memory, and needs no ffmpeg. Single-sentence scripts (and any
-    paced-synth error) use one shot; the outer fallback still covers a total Kokoro failure (rule 11)."""
     import wave
-
     import numpy as np
 
     k = _kokoro()
@@ -202,11 +143,11 @@ def _synthesize_kokoro(text: str, out_path: str) -> float:
             for i, sentence in enumerate(sentences):
                 chunk, sr = _create(sentence)
                 pieces.append(chunk)
-                if i < len(sentences) - 1:  # silence after every sentence except the last
-                    secs = payoff_gap if i == len(sentences) - 2 else gap  # longer before payoff
+                if i < len(sentences) - 1:
+                    secs = payoff_gap if i == len(sentences) - 2 else gap
                     pieces.append(np.zeros(int(sr * secs), dtype=np.float32))
             samples = np.concatenate(pieces)
-    except Exception as e:  # noqa: BLE001 — paced synth is best-effort; retry one-shot before edge
+    except Exception as e:  # noqa: BLE001
         log.warning("voice: paced kokoro synth failed (%s); using one-shot.", e)
         samples, sr = _create(text)
 
@@ -220,12 +161,10 @@ def _synthesize_kokoro(text: str, out_path: str) -> float:
 
 
 def _is_chirp_voice(name: str) -> bool:
-    """`markup` is Chirp 3 HD-only — sending it with any other voice is an API error."""
     return "chirp3-hd" in (name or "").lower()
 
 
 def _speaking_rate() -> float | None:
-    """audioConfig.speakingRate, clamped to the documented [0.25, 2.0]. None = leave unset."""
     raw = (config.get("GOOGLE_TTS_SPEAKING_RATE", "") or "").strip()
     if not raw:
         return None
@@ -237,11 +176,6 @@ def _speaking_rate() -> float | None:
 
 
 def _synthesize_google(text: str, out_dir: str) -> tuple[str, float]:
-    """Synthesize via Google Cloud TTS Chirp 3 HD (REST + API key). Returns (wav_path, seconds).
-
-    Requests LINEAR16 so the response bytes are a real WAV we measure with the stdlib `wave`
-    module (exact, no ffprobe). Raises — so the chain falls back — if the key/voice is unset
-    or the API errors."""
     import wave
 
     api_key = (config.get("GOOGLE_TTS_API_KEY", "") or "").strip()
@@ -251,9 +185,6 @@ def _synthesize_google(text: str, out_dir: str) -> tuple[str, float]:
 
     lang = config.get("GOOGLE_TTS_LANGUAGE", "en-IN")
 
-    # Chirp 3 HD reads pause tags — but only via the dedicated `markup` input field, and only on
-    # Chirp voices (the API rejects `markup` for anything else). Style tags are Gemini's and are
-    # stripped here so they can't be read aloud.
     clean = _clean_tts_text(text)
     markup = _pause_markup(text) if config.get_bool("ENABLE_PAUSE_MARKUP", True) else ""
     use_markup = _is_chirp_voice(voice_name) and _has_pause_tag(markup)
@@ -275,13 +206,9 @@ def _synthesize_google(text: str, out_dir: str) -> tuple[str, float]:
 
     r = _post({"markup": markup} if use_markup else {"text": clean})
     if r.status_code != 200 and use_markup:
-        # Fail-soft (rules 11, 14): an unexpected markup rejection should cost us the comic
-        # timing, never the good voice — retry the request the plain way before failing over.
         log.warning("voice: Chirp rejected markup (HTTP %d); retrying as plain text.", r.status_code)
         r = _post({"text": clean})
     if r.status_code != 200:
-        # Surface Google's actual reason (invalid/blocked key, byte limit, etc.) so the chain's
-        # fallback warning is actionable instead of an opaque "400 Client Error".
         raise RuntimeError(f"google tts HTTP {r.status_code}: {r.text[:500]}")
     b64 = (r.json() or {}).get("audioContent")
     if not b64:
@@ -296,21 +223,7 @@ def _synthesize_google(text: str, out_dir: str) -> tuple[str, float]:
 
 
 def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
-    """Synthesize via the Gemini Developer API TTS models. Returns (wav_path, seconds).
-
-    Uses the already-pinned google-genai SDK and the existing GEMINI_API_KEY, so this adds no
-    dependency and no new credential. Style comes from VOICE_STYLE_PROMPT plus the inline style
-    tags the scriptwriter emits — both are features of this API, unlike Chirp, which is why
-    the emotion tags finally do something here.
-
-    GEMINI_TTS_API_KEY (optional) isolates TTS onto a second free key so it cannot starve the
-    grounded ideation/scriptwriting that only Gemini can do (rule 13).
-
-    Default model is the FREE one. gemini-2.5-pro-preview-tts has no free tier, so selecting it
-    is a deliberate act, not a default.
-    """
     import wave
-
     from google import genai
     from google.genai import types
 
@@ -318,11 +231,9 @@ def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
     if not key:
         raise RuntimeError("gemini tts: GEMINI_TTS_API_KEY / GEMINI_API_KEY not set")
 
-    spoken = _style_text(text)  # keep style tags, degrade pause tags to an ellipsis
+    spoken = _style_text(text)
     style = config.get("VOICE_STYLE_PROMPT", _DEFAULT_STYLE_PROMPT)
 
-    # The API caps text and prompt at 4000 bytes each, 8000 combined. Check before spending a
-    # request: the free tier is only 10/day, so an opaque 400 would cost real quota (rule 13).
     t_bytes, p_bytes = len(spoken.encode("utf-8")), len(style.encode("utf-8"))
     if t_bytes > _GEMINI_MAX_FIELD_BYTES or p_bytes > _GEMINI_MAX_FIELD_BYTES \
             or t_bytes + p_bytes > _GEMINI_MAX_TOTAL_BYTES:
@@ -330,8 +241,6 @@ def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
             f"gemini tts: input too long (script {t_bytes}B, style {p_bytes}B; limits are "
             f"{_GEMINI_MAX_FIELD_BYTES}B each / {_GEMINI_MAX_TOTAL_BYTES}B combined)")
     model = config.get("GEMINI_TTS_MODEL", _GEMINI_TTS_PRIMARY)
-    # Zubenelgenubi ("Casual") was chosen by ear over Kore/Schedar/Algenib/Charon — it is the
-    # channel's voice identity now, not an incidental default. Re-pick via tools/tune_voice.py.
     voice_name = config.get("GEMINI_TTS_VOICE", "Zubenelgenubi")
 
     client = genai.Client(api_key=key)
@@ -344,12 +253,6 @@ def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
         ),
     )
 
-    # Try the configured model, then the stable free one. The channel's voice identity
-    # (Zubenelgenubi, picked by ear) exists ONLY on the Gemini engine, so letting a transient
-    # blip fall straight through to Chirp would silently change how the channel sounds for that
-    # reel. The preview TTS models are genuinely flaky — gemini-3.1-flash-tts-preview returned
-    # 503 "high demand" on two probes 20 minutes apart on 2026-08-07 — so staying inside the
-    # engine one extra step is worth more here than it looks (rule 11).
     attempts = [model] + ([_GEMINI_TTS_STABLE] if model != _GEMINI_TTS_STABLE else [])
     resp = last_err = None
     for attempt in attempts:
@@ -360,7 +263,7 @@ def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
                 log.warning("gemini tts: %s unavailable (%s) — fell back to %s, same voice",
                             model, str(last_err)[:120], attempt)
             break
-        except Exception as e:  # noqa: BLE001 — try the next model, then let the engine chain run
+        except Exception as e:  # noqa: BLE001
             last_err = e
             if not _is_transient(e):
                 raise
@@ -374,8 +277,6 @@ def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
     if not pcm:
         raise RuntimeError("gemini tts: empty audio")
 
-    # The response is RAW PCM, not a WAV container — without this wrapper nothing downstream
-    # (ffprobe, assembly, whisper) can read the file.
     out_path = os.path.join(out_dir, _audio_filename(spoken, ".wav"))
     with wave.open(out_path, "wb") as w:
         w.setnchannels(1)
@@ -388,15 +289,28 @@ def _synthesize_gemini(text: str, out_dir: str) -> tuple[str, float]:
 
 
 def _stream_chunks(text: str, voice: str, rate: str):
-    """Yield edge-tts stream chunks (audio + WordBoundary). Isolated for testability."""
+    """Yield edge-tts stream chunks. Wrapped in a timeout so a hanging request cannot stall
+    the entire GitHub Actions run. Raises RuntimeError if the timeout is exceeded."""
     import edge_tts
 
     comm = edge_tts.Communicate(text, voice, rate=rate)
-    yield from comm.stream_sync()
+
+    async def _collect():
+        chunks = []
+        async for chunk in comm.stream():
+            chunks.append(chunk)
+        return chunks
+
+    try:
+        chunks = asyncio.run(asyncio.wait_for(_collect(), timeout=_EDGE_TIMEOUT))
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"edge-tts stream timed out after {_EDGE_TIMEOUT}s") from e
+
+    for chunk in chunks:
+        yield chunk
 
 
 def _synthesize_edge_tts(text: str, out_path: str, voice: str, rate: str) -> float:
-    """Write MP3 to out_path; return measured duration (s). Raises if no audio came back."""
     last_end_ticks = 0
     wrote_audio = False
     with open(out_path, "wb") as f:
@@ -405,19 +319,13 @@ def _synthesize_edge_tts(text: str, out_path: str, voice: str, rate: str) -> flo
                 f.write(chunk["data"])
                 wrote_audio = True
             elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
-                # edge-tts emits SentenceBoundary by default (7.x); either gives offset+duration.
                 last_end_ticks = max(last_end_ticks, chunk["offset"] + chunk["duration"])
     if not wrote_audio:
         raise RuntimeError("edge-tts returned no audio (check voice name / connectivity).")
     return last_end_ticks / _TICKS_PER_SECOND
 
 
-# "gemini" is deliberately ABSENT from this tuple. synthesize() builds the chain as
-# [primary] + [the rest], so leaving it out means the Gemini engine is prepended only when it is
-# explicitly selected, and does not appear at all under the default VOICE_ENGINE=google. Adding
-# it here would silently put it in the fallback path for every Chirp failure.
 _ENGINE_ORDER = ("google", "edge", "kokoro")
-# Accept friendly/legacy values for VOICE_ENGINE.
 _ENGINE_ALIASES = {"edge-tts": "edge", "chirp": "google", "google-tts": "google",
                    "gemini-tts": "gemini"}
 
@@ -435,7 +343,7 @@ def _engine_google(text: str, out_dir: str) -> tuple[str, float]:
 
 
 def _engine_edge(text: str, out_dir: str) -> tuple[str, float]:
-    clean = _clean_tts_text(text)  # no tag support: a tag here would be read aloud
+    clean = _clean_tts_text(text)
     out_path = os.path.join(out_dir, _audio_filename(clean, ".mp3"))
     dur = _synthesize_edge_tts(clean, out_path, _VOICE, _RATE)
     _log_done(out_path, dur, f"edge-tts:{_VOICE}")
@@ -443,39 +351,17 @@ def _engine_edge(text: str, out_dir: str) -> tuple[str, float]:
 
 
 def _engine_kokoro(text: str, out_dir: str) -> tuple[str, float]:
-    clean = _clean_tts_text(text)  # no tag support
+    clean = _clean_tts_text(text)
     out_path = os.path.join(out_dir, _audio_filename(clean, ".wav"))
     dur = _synthesize_kokoro(clean, out_path)
     _log_done(out_path, dur, "kokoro")
     return out_path, dur
 
 
-# Inline bracket tags the scriptwriter may emit, in two families consumed by different engines:
-#   pause tags -> Chirp 3 HD's `markup` input field
-#   style tags -> Gemini TTS inline audio tags
-# Everything outside these allow-lists is stripped. An invented tag must never reach an API
-# (it 400s the request) nor the synthesiser (it gets read aloud).
 _PAUSE_TAGS = ("pause short", "pause", "pause long")
-# "beat" deliberately excluded: it is a TIMING direction, so it belongs with the pause family,
-# not here. Keeping it in the style list made the two families overlap confusingly.
-#
-# Widened 2026-08-07 against Google's documented tag list (both gemini-2.5-flash-preview-tts and
-# gemini-3.1-flash-tts-preview accept audio tags, so this is safe on the current default engine).
-# Curated, NOT exhaustive — the docs list ~16 common tags and note the real set is open-ended, but
-# an allow-list of "whatever the model might accept" is not an allow-list. Two filters applied:
-#
-#   · REGISTER — this channel is deadpan; STATUS 2026-07-27 records that its failure mode is "a
-#     narrator who announces the joke". So [excited], [amazed] and [giggles] are excluded as hype
-#     even though they are documented and would work.
-#   · RULE 6 — [crying], [panicked], [trembling], [gasp] and [shouting] are excluded outright.
-#     Melodrama over real events is how a news channel drifts into tragedy exploitation.
-#
-# Undocumented but kept: deadpan/dry/amused/flat. Google's docs say the tag set is open-ended and
-# to experiment; these four ARE the channel's core register and predate this list.
+
 _STYLE_TAGS = (
-    # documented (ai.google.dev/gemini-api/docs/speech-generation)
     "sarcastic", "serious", "curious", "whispers", "tired", "mischievously", "sighs", "laughs",
-    # undocumented, experimental, on-register
     "deadpan", "dry", "amused", "flat",
 )
 
@@ -491,15 +377,6 @@ def _tag_limit(key: str, default: int) -> int:
 
 def _filter_tags(text: str, keep: tuple[str, ...], limit: int,
                  pause_as_ellipsis: bool = False) -> str:
-    """Keep at most `limit` allow-listed bracket tags; strip every other tag.
-
-    The cap is enforced HERE rather than trusted to the prompt: a prompt asks, a guard is what
-    makes it true. Over-tagging a 25-30s Short reads as sluggish.
-
-    `pause_as_ellipsis` degrades a pause tag to "..." instead of deleting it. Bracket pause
-    syntax is Chirp-only, but Chirp is no longer the primary engine — without this the comic
-    beat would silently vanish on the engine that actually ships. An ellipsis is plain text, so
-    every engine reads it as a deliberate pause and none can read it aloud."""
     kept = 0
 
     def _sub(m: re.Match) -> str:
@@ -518,29 +395,19 @@ def _filter_tags(text: str, keep: tuple[str, ...], limit: int,
 
 
 def has_style_tag(text: str) -> bool:
-    """True if `text` carries at least one style tag this module would actually forward.
-
-    Public because the scriptwriter needs to know whether a finished script has any delivery
-    direction, and it must ask THIS module rather than keep its own copy of the allow-list — two
-    lists that drift is precisely how [curious] came to be emitted-but-silently-stripped.
-    """
     return any(m.group(1) and m.group(1).strip().lower() in _STYLE_TAGS
                for m in _TAG_RE.finditer(text or ""))
 
 
 def _clean_tts_text(text: str) -> str:
-    """Strip every tag — for engines with no tag support (edge-tts, Kokoro)."""
     return _filter_tags(text, (), 0)
 
 
 def _pause_markup(text: str) -> str:
-    """Chirp 3 HD `markup`: keep pause tags, drop style tags."""
     return _filter_tags(text, _PAUSE_TAGS, _tag_limit("MAX_PAUSE_TAGS", 3))
 
 
 def _style_text(text: str) -> str:
-    """Gemini TTS input: keep style tags; pause tags degrade to an ellipsis so the beat survives
-    on the primary engine (Chirp's bracket pause syntax means nothing here)."""
     return _filter_tags(text, _STYLE_TAGS, _tag_limit("MAX_STYLE_TAGS", 3),
                         pause_as_ellipsis=True)
 
@@ -550,19 +417,8 @@ def _has_pause_tag(text: str) -> bool:
 
 
 def synthesize(script_body: str, out_dir: str) -> tuple[str, float]:
-    """Return (audio_path, duration_seconds) via an ordered fallback chain (rule 11):
-    google (Chirp 3 HD) → edge-tts (en-IN) → kokoro. VOICE_ENGINE picks the primary engine;
-    the remaining engines follow as fallbacks. Engines are resolved by name at call time, so a
-    missing key/model just advances to the next link.
-
-    Raises ValueError on empty input, RuntimeError only if EVERY engine fails — the orchestrator
-    skips that one reel and keeps the batch going (rule 14: soft on runtime).
-    """
-    # Tags are NOT stripped here: each engine filters for itself, because which tags are
-    # meaningful depends on the engine (Chirp reads pause tags, Gemini reads style tags, edge-tts
-    # and Kokoro read neither). Stripping up front is what made the tags a no-op before.
     raw = (script_body or "").strip()
-    if not _clean_tts_text(raw):  # tags alone are stage direction, not narration
+    if not _clean_tts_text(raw):
         raise ValueError("voice.synthesize: empty script_body.")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -577,7 +433,7 @@ def synthesize(script_body: str, out_dir: str) -> tuple[str, float]:
             continue
         try:
             return fn(raw, out_dir)
-        except Exception as e:  # noqa: BLE001 — try the next engine in the chain (rule 11)
+        except Exception as e:  # noqa: BLE001
             log.warning("voice: engine %s failed (%s); trying next", name, e)
             errors.append(f"{name}: {e}")
     raise RuntimeError("voice.synthesize: all engines failed — " + " | ".join(errors))
