@@ -1,19 +1,19 @@
-"""Module 5 — Visuals (stock B-roll / AI images).
+"""Module 5 — Visuals (stock B-roll).
 
 Contract:
-    what it does : finds + downloads CC0 vertical B-roll OR generates AI images for a script.
+    what it does : finds + downloads CC0 vertical B-roll for a script's keywords.
     input        : script_body or keyword list; target duration; output dir.
     output       : list of local clip paths covering the narration length.
-    depends on   : Pexels/Pixabay (stock) + Cloudflare Workers AI (ai); requests; src.config.
+    depends on   : Pexels API (primary) -> Pixabay (backup) (rule 11); requests; src.config.
 
-VISUAL_SOURCE picks the strategy:
-    'photos' (default) -> Pexels stock photos + Ken Burns
-    'ai'               -> Cloudflare Flux + Ken Burns
-    'video'            -> Pexels/Pixabay stock video
+COPYRIGHT SAFETY (docs/08 §3): CC0 stock only — NEVER broadcaster/agency footage. Both
+Pexels and Pixabay are commercial-use, no-attribution. Prefer maps/charts/data-viz for impact
+stories (push that via keywords). Assembly cuts every `CLIP_SECONDS` (3.5s by default), so we
+gather several short clips for variety, not one long one — and ask `assembly.slice_count()` how
+many rather than guessing, so image B-roll covers every cut instead of looping.
 
-The CF_API_TOKEN and CF_ACCOUNT_ID values are stripped of any whitespace/newline characters
-before use, because GitHub Secrets are sometimes stored with a trailing newline that breaks
-the HTTP Authorization header ("Invalid leading whitespace" error).
+Clips are render artifacts: download to a temp dir, let assembly consume them, then delete
+(rule 15). Filenames are content-hashed so a cron retry reuses the cache (rule 12).
 """
 from __future__ import annotations
 
@@ -35,14 +35,16 @@ log = logging.getLogger(__name__)
 _PEXELS_VIDEO_SEARCH = "https://api.pexels.com/videos/search"
 _PEXELS_PHOTO_SEARCH = "https://api.pexels.com/v1/search"
 _PIXABAY_VIDEO_SEARCH = "https://pixabay.com/api/videos/"
-_TIMEOUT = 30
-_SLICE_SECONDS = 8.0
-_PER_KEYWORD = 3
+_TIMEOUT = 30          # seconds per HTTP call
+_SLICE_SECONDS = 8.0   # planned cut length in assembly → coverage unit per clip
+_PER_KEYWORD = 3       # candidates pulled per keyword
 
-_IMAGE_CLIP_SECONDS = 7.0
-_MAX_IMG_CLIPS = 12
-_MAX_VIDEO_CLIPS = 12
+# Image-based visuals (photos / AI) → Ken Burns clips. Default source is "photos".
+_IMAGE_CLIP_SECONDS = 7.0   # comfortably longer than assembly's 3.5s slice
+_MAX_IMG_CLIPS = 12         # cap API calls + ffmpeg conversions per reel
+_MAX_VIDEO_CLIPS = 12       # same cap for the stock-video path (bounds downloads per reel)
 
+# Minimal stopword set for the heuristic keyword fallback (no NLTK dependency).
 _STOPWORDS = frozenset(
     "the a an and or but of to in on for with as at by from is are was were be been it its "
     "this that these those they them their there here what which who how why when where will "
@@ -52,6 +54,7 @@ _STOPWORDS = frozenset(
 
 
 def _keywords_heuristic(script_body: str, n: int) -> list[str]:
+    """Frequency-ranked content words — the deterministic fallback (rule 11)."""
     words = re.findall(r"[a-zA-Z][a-zA-Z'-]{2,}", script_body.lower())
     freq: dict[str, int] = {}
     for w in words:
@@ -63,29 +66,32 @@ def _keywords_heuristic(script_body: str, n: int) -> list[str]:
 
 def _keywords_via_llm(script_body: str, n: int) -> list[str]:
     prompt = (
-        f"You are a cinematic storyboard artist picking AI image prompts for a romance "
-        f"storytelling Short. Give exactly {n} CONCRETE, VISUAL scene descriptions (2-4 words "
-        f"each) that an AI image model can render as anime-style illustrations. Order them to "
-        f"follow the story beats so the visuals track what is being said.\n"
-        f"KEY RULE: pick specific SCENES with a subject, action, and mood — not abstract concepts. "
-        f"Translate emotion into filmable imagery:\n"
-        f"  love/longing -> 'young woman staring at rain', 'empty train platform at dusk'\n"
-        f"  separation -> 'silhouette walking away in fog', 'closed door, warm light'\n"
-        f"  reunion -> 'two hands almost touching', 'tearful smile in crowd'\n"
-        f"  letter/memory -> 'old envelope on wooden table', 'faded photograph in hands'\n"
-        f"  family -> 'mother and daughter silhouettes', 'empty chair by window'\n"
-        f"  nature/season -> 'monsoon rain on window', 'autumn leaves on bench'\n"
-        f"  city -> 'streetlamp in evening rain', 'train window passing lights'\n"
-        f"  time passing -> 'clock on wall', 'calendar pages fluttering'\n"
-        f"Prefer visually striking, emotional subjects that hold attention. AVOID proper nouns, "
-        f"logos, and abstract words (love, destiny, hope) — only things a camera can see.\n\n"
+        f"You are a stock-footage researcher picking B-roll search queries for a news Short. "
+        f"Give exactly {n} CONCRETE, literal, FILMABLE queries (1-3 words each) that stock sites "
+        f"(Pexels/Pixabay) actually have footage for, matching this narration. Order them to follow "
+        f"the story beats so the visuals track what's being said.\n"
+        f"KEY RULE: stock sites do NOT have clips of specific people, brands, or named events — "
+        f"so TRANSLATE every proper noun into a filmable stand-in:\n"
+        f"  politician/government -> 'parliament building', 'indian flag', 'government office'\n"
+        f"  court case/legal -> 'courtroom', 'judge gavel', 'law books'\n"
+        f"  ISRO/space mission -> 'rocket launch', 'satellite orbit', 'mission control'\n"
+        f"  economy/stocks -> 'stock market screen', 'indian currency', 'city skyline'\n"
+        f"  AI/tech -> 'data center', 'circuit board', 'person using laptop'\n"
+        f"  oil/energy -> 'oil refinery', 'oil pump jack', 'cargo ship'\n"
+        f"  defense/military -> 'military jet', 'naval warship', 'radar screen'\n"
+        f"  infrastructure -> 'bullet train', 'highway traffic', 'construction crane'\n"
+        f"  crypto/finance -> 'bitcoin coin', 'gold bars', 'digital vault'\n"
+        f"  sport -> 'football stadium', 'soccer match', 'cheering crowd'\n"
+        f"Prefer visually striking, high-motion subjects (they hold attention): places, objects, "
+        f"people doing things, nature, cities, crowds, maps. AVOID proper nouns, logos, and abstract "
+        f"words (policy, economy, impact) entirely — only things a camera can film.\n\n"
         f"NARRATION:\n{script_body}\n\n"
-        f'Output ONE valid JSON object and nothing else: '
-        f'{{"keywords": ["scene one", "scene two"]}}'
+        f'Output ONE valid JSON object and nothing else, no markdown or fences: '
+        f'{{"keywords": ["query one", "query two"]}}'
     )
     import json
 
-    raw = llm.generate(prompt, json=True, max_tokens=300, prefer_groq=True)
+    raw = llm.generate(prompt, json=True, max_tokens=200, prefer_groq=True)
     start, end = raw.find("{"), raw.rfind("}")
     data = json.loads(raw[start : end + 1], strict=False)
     kws = [str(k).strip() for k in data.get("keywords", []) if str(k).strip()]
@@ -95,17 +101,19 @@ def _keywords_via_llm(script_body: str, n: int) -> list[str]:
 
 
 def extract_keywords(script_body: str, n: int = 5) -> list[str]:
+    """Pull 3-6 search keywords from the script (LLM, with a heuristic fallback)."""
     text = (script_body or "").strip()
     if not text:
         return []
     try:
         return _keywords_via_llm(text, n)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — never let keyword extraction kill the reel
         log.warning("visuals: LLM keyword extraction failed (%s); using heuristic", e)
         return _keywords_heuristic(text, n)
 
 
 def _pick_portrait_file(video: dict) -> str | None:
+    """Choose the best portrait mp4 file link (closest to 1080 wide), or None."""
     files = [
         f for f in video.get("video_files", [])
         if f.get("file_type") == "video/mp4" and (f.get("height") or 0) > (f.get("width") or 0)
@@ -117,6 +125,7 @@ def _pick_portrait_file(video: dict) -> str | None:
 
 
 def _pexels_search(keyword: str) -> list[dict]:
+    """Return [{url, duration}] portrait clips from Pexels for one keyword."""
     resp = requests.get(
         _PEXELS_VIDEO_SEARCH,
         headers={"Authorization": config.require("PEXELS_API_KEY")},
@@ -134,6 +143,7 @@ def _pexels_search(keyword: str) -> list[dict]:
 
 
 def _pixabay_search(keyword: str) -> list[dict]:
+    """Return [{url, duration}] clips from Pixabay (backup). No portrait filter available."""
     key = config.get("PIXABAY_API_KEY")
     if not key:
         return []
@@ -153,6 +163,7 @@ def _pixabay_search(keyword: str) -> list[dict]:
 
 
 def _gather_candidates(keywords: list[str]) -> list[dict]:
+    """Interleave Pexels results across keywords (variety); fall back to Pixabay if empty."""
     per_kw: list[list[dict]] = []
     for kw in keywords:
         try:
@@ -177,6 +188,7 @@ def _gather_candidates(keywords: list[str]) -> list[dict]:
 
 
 def _interleave(lists: list[list[dict]]) -> list[dict]:
+    """Round-robin flatten so consecutive clips come from different keywords."""
     out: list[dict] = []
     for i in range(max((len(x) for x in lists), default=0)):
         for lst in lists:
@@ -202,15 +214,15 @@ def _img_prompt(keyword: str) -> str:
     """Build the AI-image prompt. Style is tunable via IMAGE_STYLE for the channel's look."""
     style = config.get(
         "IMAGE_STYLE",
-        "anime style, Makoto Shinkai aesthetic, soft pastel colors, emotional atmosphere, "
-        "cinematic composition, golden hour, detailed background, 2D illustration, "
-        "no text, no watermark",
+        "cinematic, photorealistic, dramatic lighting, shallow depth of field, "
+        "high detail, professional documentary news b-roll, no text, no watermark",
     )
     return f"{keyword}, {style}, vertical 9:16 composition"
 
 
 @lru_cache(maxsize=64)
 def _pexels_photo_urls(keyword: str) -> tuple[str, ...]:
+    """Portrait stock-photo URLs from Pexels for one keyword (cached). () on failure."""
     try:
         resp = requests.get(
             _PEXELS_PHOTO_SEARCH,
@@ -229,14 +241,8 @@ def _pexels_photo_urls(keyword: str) -> tuple[str, ...]:
 
 
 def _cloudflare_image(prompt: str, dest: str) -> bool:
-    """Generate an AI image via Cloudflare Workers AI (Flux). Needs CF_API_TOKEN + CF_ACCOUNT_ID.
-
-    Strips whitespace and newlines from both credentials before use — GitHub Secrets are
-    sometimes stored with a trailing newline that produces the "Invalid leading whitespace"
-    error on the HTTP Authorization header.
-    """
-    token = str(config.get("CF_API_TOKEN") or "").strip().replace("\n", "").replace("\r", "")
-    acct = str(config.get("CF_ACCOUNT_ID") or "").strip().replace("\n", "").replace("\r", "")
+    """Generate an AI image via Cloudflare Workers AI (Flux). Needs CF_API_TOKEN + CF_ACCOUNT_ID."""
+    token, acct = config.get("CF_API_TOKEN"), config.get("CF_ACCOUNT_ID")
     if not (token and acct):
         return False
     model = config.get("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
@@ -264,6 +270,7 @@ def _cloudflare_image(prompt: str, dest: str) -> bool:
 
 def _fetch_image(keyword: str, dest: str, seed: int, source: str,
                  variant: str = "") -> bool:
+    """Put one image at dest: AI (if source='ai' and CF set) else a Pexels photo. Bool = success."""
     if source == "ai" and _cloudflare_image(_img_prompt(keyword), dest):
         return True
     urls = _pexels_photo_urls(keyword)
@@ -279,13 +286,14 @@ def _fetch_image(keyword: str, dest: str, seed: int, source: str,
 
 
 def _image_to_kenburns_clip(image_path: str, dest: str, seconds: float, index: int = 0) -> None:
+    """Render a slow Ken Burns move over an image → 1080x1920 mp4 clip (FFmpeg)."""
     from src.assembly import _ffmpeg
 
     frames = int(seconds * 30)
     if index % 2 == 0:
-        z = "min(zoom+0.0010,1.12)"
+        z = "min(zoom+0.0010,1.12)"                      # slow zoom IN
     else:
-        z = "if(eq(on,0),1.12,max(zoom-0.0009,1.0))"
+        z = "if(eq(on,0),1.12,max(zoom-0.0009,1.0))"     # slow zoom OUT (start zoomed, pull back)
     vf = (
         "scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,"
         f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
@@ -302,6 +310,7 @@ def _image_to_kenburns_clip(image_path: str, dest: str, seconds: float, index: i
 
 def _fetch_image_broll(keywords: list[str], target_seconds: float, out_dir: str, source: str,
                        variant: str = "") -> list[str]:
+    """Build Ken Burns clips from photos/AI images covering the narration. Raises if none made."""
     from src import assembly
 
     n = min(_MAX_IMG_CLIPS, assembly.slice_count(target_seconds))
@@ -324,6 +333,10 @@ def _fetch_image_broll(keywords: list[str], target_seconds: float, out_dir: str,
 
 
 def fetch_broll(keywords: list[str], target_seconds: float, out_dir: str) -> list[str]:
+    """Return vertical clip paths covering target_seconds. VISUAL_SOURCE picks the strategy:
+    'photos' (default, Pexels stock photos + Ken Burns), 'ai' (Cloudflare Flux + Ken Burns),
+    or 'video' (Pexels/Pixabay stock video). Image sources fall back to stock video on failure.
+    """
     if not keywords:
         raise ValueError("visuals.fetch_broll: no keywords provided.")
     os.makedirs(out_dir, exist_ok=True)
@@ -340,6 +353,7 @@ def fetch_broll(keywords: list[str], target_seconds: float, out_dir: str) -> lis
 
 
 def _fetch_video_broll(keywords: list[str], target_seconds: float, out_dir: str) -> list[str]:
+    """Stock-video B-roll: Pexels then Pixabay (the original strategy)."""
     candidates = _gather_candidates(keywords)
     if not candidates:
         raise RuntimeError(f"visuals: no B-roll found on Pexels/Pixabay for {keywords}.")
