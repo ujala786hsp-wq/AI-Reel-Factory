@@ -20,6 +20,7 @@ edge-tts==7.2.8               # narration fallback (free, no key)
 # NOTE: assembly/visuals call the FFmpeg *binary* directly via subprocess (no Python wrapper) —
 # install FFmpeg as a system dep (winget Gyan.FFmpeg / apt). On CI, install it onto PATH.
 faster-whisper==1.2.1         # word-level timestamps for karaoke captions
+av>=12,<14
 numpy==2.4.6                  # Kokoro PCM handling (also a transitive dep)
 pillow==12.2.0                # graphics.py stat-card PNGs (ENABLE_GRAPHIC_CARDS overlay path)
 
