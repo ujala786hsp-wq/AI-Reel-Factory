@@ -1,114 +1,356 @@
-"""Module 1 — Romance Story Ideation (free-API, no news feed).
+"""Module 1 (fallback) — free-API ideation when the Claude Routine didn't run.
 
 Contract:
-    what it does : generates romance/emotional story concepts for 2-3 minute Hindi narrations.
-    how to use   : `generate_ideas(n)` for on-demand, `run_fallback_ideation()` for scheduled.
+    what it does : produces the same idea rows as routines/ideation.md, via Gemini/Groq.
+    how to use   : `run_fallback_ideation()` — called by the orchestrator only when
+                   Supabase has no pending ideas for today (rule 11/12).
     depends on   : src.llm, src.db, src.config.
 
-This replaces the news-based ideation engine. There are no headlines to fetch and no sources
-to verify — a fictional romance story has neither. The LLM is the sole ideation source, and
-every idea is human-approved via Telegram before production.
+ToS (rule 4): this uses the Gemini/Groq DEVELOPER APIs — never Claude. Same JSON contract
+and the same sensitivity/sourcing rules as the Routine (docs/08-news-niche-playbook.md).
 
-Schema (unchanged so the rest of the pipeline works):
-    title        -> the story's headline (English for SEO, emotion intact)
-    hook         -> the opening line of the narration (Hindi, sets the emotional scene)
-    angle        -> the emotional core / twist the story delivers
-    est_score    -> LLM's self-rated strength (0.0-1.0)
-    sources      -> always [] for fiction; the caption's citation gate is skipped for this niche
+CAVEAT (honesty over polish): unlike the Claude Routine, the free dev APIs have no live web
+search here, so model-supplied source URLs may be stale/uncertain. This is a rare-day backup;
+the human Telegram approval is the safety net, and the scriptwriter still cites sources. Ideas
+that don't carry >= MIN_SOURCES plausible URLs are dropped rather than shipped unsourced.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 
-from src import config, db, llm
+import requests
+
+from urllib.parse import urlparse
+
+from src import config, db, llm, news, trends
 
 log = logging.getLogger(__name__)
 
-_MAX_IDEAS = 10
-_MIN_IDEAS = 2
+_MAX_IDEAS = 20
+_MIN_IDEAS = 5  # below this, treat the run as failed rather than ship a thin digest
 
+# Columns the `ideas` table actually has — `share_score` is ranking-only, never persisted.
 _ROW_KEYS = ("niche", "title", "hook", "angle", "est_score", "sources")
 
-_PROMPT = """You are the story editor for a Hindi/Urdu romance storytelling channel. \
-The channel publishes 2-3 minute cinematic narratives — one-sided love, fate, longing, \
-separation, reunion. The audience is South Asian, watches on mobile, and wants to feel \
-something real in the first 5 seconds.
 
-Generate {n} DISTINCT romance story concepts. Each must be a complete emotional arc, not a \
-premise. Return English titles (for search) but write the hook and angle in English too — \
-the scriptwriter will translate to Hindi.
+def _to_rows(ideas: list[dict]) -> list[dict]:
+    """Project validated ideas to the DB columns (drops ranking-only fields like share_score)."""
+    return [{k: idea[k] for k in _ROW_KEYS} for idea in ideas]
 
-REQUIREMENTS PER IDEA:
 
-1. TITLE (English, <=70 chars, searchable): a curiosity-driven title that names the emotional \
-   situation. Examples of the RIGHT style:
-     - "She Waited 40 Years For A Letter That Never Came"
-     - "He Loved Her From Afar For 12 Years — Then She Asked Him One Question"
-     - "The Girl Who Chose The Wrong Brother"
-   NOT: "A Story About Love", "True Love", "Heartbreaking Romance"
+def _rank_key(idea: dict):
+    """Sort key: share_score first (virality), est_score as tiebreaker. Highest first."""
+    return (-idea.get("share_score", idea["est_score"]), -idea["est_score"])
 
-2. HOOK (English, 1-2 sentences, the first 5 seconds): a SPECIFIC moment, image, or line that \
-   drops the viewer into the scene. Use concrete detail — weather, an object, a sound, a \
-   gesture. Examples:
-     - "The letter was still sealed. She had carried it in her purse for nine years."
-     - "He learned her name only on the day she got married."
-   NOT: "Love is complicated.", "Sometimes we lose what we love most."
 
-3. ANGLE (English, 2-3 sentences): the emotional core — what the story is really about, and \
-   the twist or revelation that makes it worth 2-3 minutes. This is the "why it matters" \
-   emotional turn. Examples:
-     - "He built a life around a promise she never made. The story is about how we invent \
-        reasons for the people we cannot let go of — and what it costs when the invention \
-        finally breaks."
-   NOT: "It is a sad story about love."
+# Tiny stopword set so near-identical titles overlap on meaningful words, not glue words.
+_STOPWORDS = {"the", "a", "an", "of", "to", "in", "for", "and", "is", "on", "with",
+              "at", "by", "from", "as", "new", "today"}
 
-4. EST_SCORE (0.0-1.0): rate this story's emotional pull and shareability. Spread the scores \
-   across the range — strongest near 0.9, weakest near 0.4. Do not give everything ~0.8.
 
-GENRE PALETTE (spread across these, one per idea): one-sided love, long-distance separation, \
-family disapproval, missed timing, reunion after decades, sacrifice for a sibling or friend, \
-love that becomes friendship, forbidden love across class or religion, love across distance \
-(letter/phone/internet), love interrupted by war or migration.
+def _tokens(title: str) -> set[str]:
+    """Significant lowercased word tokens of a title (numbers kept, stopwords dropped)."""
+    return {t for t in re.findall(r"[a-z0-9]+", title.lower()) if t not in _STOPWORDS}
 
-TONE: emotionally honest, specific, never melodramatic. NO: violence, communal/religious \
-incitement, suicide, explicit content, exploitative tragedy. Characters are ordinary people \
-in real situations.
+# The daily Anthropic Routine (Claude + web research) commits its ideas here; the on-demand
+# flow prefers these over the Gemini/Groq fallback. See routines/ideation.md.
+_ROUTINE_IDEAS_FILE = "data/daily-ideas.json"
 
-LENGTH TARGET: each story should sustain a 400-500 word Hindi narration (2-3 minutes when \
-spoken slowly with pauses). If a concept cannot fill that, replace it.
+_PROMPT = """You are the ideation engine for "But It Matters", a channel of daily, punchy \
+**25-30 second** news/info Shorts (India + world). Turn the SELECTED stories below into {n} \
+TIMELY ideas a human will approve 4-5 of — each a single crisp on-point fact that still carries \
+one honest "why it matters" angle (not a bare summary), with strong scroll-stopping, \
+share-worthy potential.
+
+SELECTED DISTINCT STORIES (write EXACTLY ONE idea per story, in order; NEVER two ideas on the \
+same event):
+{selected}
+
+PRIMARY ANCHOR — REAL CURRENT HEADLINES (verify the facts against these; prefer these real \
+stories over generic evergreen topics):
+{headlines}
+
+SUPPLEMENTARY TREND SIGNAL (optional flavour only; ignore generic weather/calendar/sports-score noise):
+{trending}
+
+WINNING TITLE STYLES ON THIS CHANNEL (these actual published titles + view counts show what the \
+feed rewards — copy the ENERGY and framing, never the exact title; if empty, ignore):
+{winners}
+
+HONEST SCROLL APPEAL: pick the angle a smart person finds genuinely surprising or consequential \
+— real stakes, money & power, conflict with real consequences, science/space, big human impact. \
+The hook must be a TRUE curiosity gap the explainer can actually CLOSE (a bait topic the facts \
+can't support gets suppressed). Apply a SHARE TEST: would someone send this to a friend? Set \
+share_score by that; set est_score by how strong an HONEST hook plus a real "why it matters" \
+angle the story supports — never by how dramatic a title you could slap on it.
+
+SCORE CALIBRATION (IMPORTANT): RANK the ideas against each OTHER and SPREAD the scores across the \
+full 0.0-1.0 range — do NOT give everything ~1.0. The strongest single idea may approach 1.0, the \
+weakest should sit near 0.3-0.5, and the rest in between. Use DISTINCT share_score values so the \
+list has a clear best-to-worst order; est_score may differ from share_score per idea.
+
+ACCURACY (CRITICAL — this is the #1 rule): propose only REAL, verifiable developments that \
+ACTUALLY happened recently. NEVER invent product names, version numbers, launches, statistics, \
+quotes, or events, and never attribute a claim to a company/person unless it's real. If unsure a \
+thing genuinely happened, DO NOT make it up — choose a different real story. When unsure, \
+generalize truthfully rather than invent specifics. Fabricated news = instant demonetization and strikes.
+
+FRAMING RULES: the standard is TRUTH, not neutrality. Say what the evidence actually supports, \
+even when that is unflattering to a government, company or party — a well-sourced conclusion is \
+not "taking a side". You MAY reach a verdict and say plainly who is responsible, provided every \
+load-bearing fact is verifiable and cited. What you may NOT do is assert anything you cannot \
+source: an unverifiable claim is worthless however satisfying it sounds. Politics, government \
+actions and court rulings are fully in scope. EXCLUDE only: communal/religious incitement or \
+hate; anything that could inflame violence; unverified rumors/claims stated as fact; deepfakes/\
+impersonation; graphic tragedy exploitation; medical/financial advice stated as fact.
+
+Each idea: a PUNCHY, curiosity-driven title honest to the story (NOT a dry "X explained" search \
+title, NOT a bait title the facts can't back); a story that lands in 25-30 seconds (a single \
+development with a sharp angle, not a deep-dive); a "hook" that is a genuine first-2-seconds \
+scroll-stopper (one surprising true fact); and a share_score.
+
+SOURCES — READ THIS CAREFULLY: real citations are attached AUTOMATICALLY from the live search \
+and the news feed above, so you do NOT need to supply them. Put a URL in "sources" ONLY if you \
+are certain that exact page exists; otherwise return "sources": []. An empty list is CORRECT \
+and costs nothing. A guessed or pattern-matched URL is worse than none: it 404s, the idea is \
+discarded, and >= {min_src} real sources are needed to ship.
 
 Return ONLY JSON:
-{{"ideas": [{{"title": "...", "hook": "...", "angle": "...", "est_score": 0.0}}]}}
+{{"ideas": [{{"niche": "impact-news", "title": "...", "hook": "the first 3 seconds", \
+"angle": "the original why-it-matters take", "est_score": 0.0, "share_score": 0.0, \
+"sources": ["https://...", "https://..."]}}]}}
 """
 
 
 def _parse_ideas(raw: str) -> list[dict]:
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1 or end < start:
-        raise ValueError(f"ideation: no JSON object in reply: {raw[:200]!r}")
+        raise ValueError(f"ideation_fallback: no JSON object in reply: {raw[:200]!r}")
+    # strict=False: grounded LLM JSON often has raw newlines/tabs inside string values.
     data = json.loads(raw[start : end + 1], strict=False)
-    ideas = data.get("ideas", [])
+    ideas = data.get("ideas", data if isinstance(data, list) else [])
     if not isinstance(ideas, list):
-        raise ValueError("ideation: 'ideas' is not a list.")
+        raise ValueError("ideation_fallback: 'ideas' is not a list.")
     return ideas
 
 
-def _to_rows(ideas: list[dict]) -> list[dict]:
-    """Project validated ideas to the DB columns. Sources are always [] for fiction."""
-    rows = []
+def _clean_sources(raw_sources) -> list[str]:
+    if not isinstance(raw_sources, list):
+        return []
+    seen, out = set(), []
+    for s in raw_sources:
+        s = str(s).strip()
+        if s.lower().startswith(("http://", "https://")) and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# Codes that mean the publisher itself says the page does not exist. Deliberately NARROW:
+# news sites answer 401/403 to anything that looks like a bot (NDTV and Bloomberg both did,
+# measured 2026-09-01), and treating those as dead would bin good ideas citing real articles.
+_DEAD_CODES = (404, 410)
+_SOURCE_TIMEOUT = 12
+# A browser UA, because several publishers 403 the python-requests default outright — which
+# would make the check useless rather than merely conservative.
+_SOURCE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def _url_is_dead(url: str) -> bool:
+    """True only when the publisher answers 404/410 for `url`."""
+    try:
+        resp = requests.get(url, timeout=_SOURCE_TIMEOUT, allow_redirects=True,
+                            stream=True, headers={"User-Agent": _SOURCE_UA})
+        try:
+            return resp.status_code in _DEAD_CODES
+        finally:
+            resp.close()
+    except Exception:  # noqa: BLE001 — a failed probe is NOT evidence the article is missing
+        return False
+
+
+# How much of the smaller token set two titles must share to count as the same story, plus a
+# floor on the raw overlap.
+_STORY_MATCH_RATIO = 0.4
+_STORY_MATCH_MIN_TOKENS = 2
+
+
+def _match_story_urls(idea: dict, stories: list[dict]) -> list[str]:
+    """Feed article URLs for the story this idea is actually about ([] if none match)."""
+    idea_toks = _tokens(f"{idea.get('title', '')} {idea.get('hook', '')}")
+    if not idea_toks:
+        return []
+    out = []
+    for story in stories:
+        story_toks = _tokens(story.get("title", ""))
+        if not story_toks:
+            continue
+        shared = idea_toks & story_toks
+        if len(shared) >= _STORY_MATCH_MIN_TOKENS and \
+                len(shared) / min(len(idea_toks), len(story_toks)) >= _STORY_MATCH_RATIO:
+            url = (story.get("url") or "").strip()
+            if url and url not in out:
+                out.append(url)
+    return out
+
+
+def _is_homepage(url: str) -> bool:
+    """True for a bare site root ('https://www.bbc.com/') — never a citation for a claim."""
+    try:
+        return urlparse(url).path.strip("/") == "" and not urlparse(url).query
+    except ValueError:
+        return True
+
+
+def _resolve_redirect(url: str) -> str:
+    """Follow a citation redirect to the publisher's own URL; return `url` unchanged on failure."""
+    try:
+        resp = requests.get(url, timeout=_SOURCE_TIMEOUT, allow_redirects=True,
+                            stream=True, headers={"User-Agent": _SOURCE_UA})
+        try:
+            return resp.url or url
+        finally:
+            resp.close()
+    except Exception:
+        return url
+
+
+def _idea_spans(raw: str, ideas: list[dict]) -> list[tuple[int, int]]:
+    """Character span of each idea's object in the raw reply."""
+    starts = []
+    cursor = 0
     for idea in ideas:
-        row = {k: idea.get(k) for k in _ROW_KEYS}
-        row["sources"] = []          # fiction has no external sources
-        rows.append(row)
-    return rows
+        at = raw.find(str(idea.get("title", "")), cursor) if idea.get("title") else -1
+        starts.append(at)
+        if at >= 0:
+            cursor = at + 1
+    spans = []
+    for i, start in enumerate(starts):
+        if start < 0:
+            spans.append((-1, -1))
+            continue
+        nxt = next((s for s in starts[i + 1:] if s > start), len(raw))
+        spans.append((start, nxt))
+    return spans
 
 
-def _validate(ideas: list[dict]) -> list[dict]:
-    """Keep well-formed ideas; coerce fields. No source check — fiction has no sources."""
-    niche = config.get("NICHE", "romance-stories")
-    clean = []
-    seen_titles: set[str] = set()
+def _content_ranges(raw: str, idea: dict, lo: int, hi: int) -> list[tuple[int, int]]:
+    """Where this idea's OWN words sit inside its span of the raw reply."""
+    out = []
+    for key in ("title", "hook", "angle"):
+        val = str(idea.get(key) or "")
+        if not val:
+            continue
+        for needle in (val, json.dumps(val, ensure_ascii=False)[1:-1]):
+            at = raw.find(needle, lo, hi)
+            if at >= 0:
+                out.append((at, at + len(needle)))
+                break
+    return out
+
+
+def _overlap(s: int, e: int, ranges: list[tuple[int, int]]) -> int:
+    return sum(max(0, min(e, b) - max(s, a)) for a, b in ranges)
+
+
+def _citations_by_idea(ideas: list[dict], raw: str, grounded: list[dict]) -> list[list[dict]]:
+    """Which grounded citations back which idea — each support credited to ONE idea."""
+    owned: list[list[dict]] = [[] for _ in ideas]
+    if len(ideas) == 1:
+        owned[0] = list(grounded)
+        return owned
+    spans = _idea_spans(raw, ideas)
+    content = [_content_ranges(raw, idea, lo, hi) if lo >= 0 else []
+               for idea, (lo, hi) in zip(ideas, spans)]
+    for g in grounded:
+        owners: set[int] = set()
+        for s, e in g.get("spans", []):
+            scores = [_overlap(s, e, ranges) for ranges in content]
+            if not any(scores):
+                scores = [_overlap(s, e, [span]) if span[0] >= 0 else 0 for span in spans]
+            best = max(scores, default=0)
+            if best > 0:
+                owners.update(i for i, score in enumerate(scores) if score == best)
+        for i in sorted(owners):
+            owned[i].append(g)
+    return owned
+
+
+def _attach_real_sources(ideas: list[dict], raw: str, grounded: list[dict],
+                         stories: list[dict]) -> list[dict]:
+    """Replace each idea's sources with REAL ones, best first."""
+    resolved: dict[str, str] = {}
+
+    for idea, mine in zip(ideas, _citations_by_idea(ideas, raw, grounded)):
+        publisher = []
+        for g in mine:
+            uri = g.get("uri", "")
+            if not uri:
+                continue
+            if uri not in resolved:
+                resolved[uri] = _resolve_redirect(uri)
+            if resolved[uri] not in publisher:
+                publisher.append(resolved[uri])
+        model_written = [u for u in _clean_sources(idea.get("sources")) if not _is_homepage(u)]
+        fetched = [u for u in [*publisher, *_match_story_urls(idea, stories)]
+                   if not _is_homepage(u)]
+        merged: list[str] = []
+        for url in [*fetched, *model_written]:
+            if url not in merged and not _is_homepage(url):
+                merged.append(url)
+        idea["sources"] = _search_for_more(idea, merged,
+                                           trusted=len(dict.fromkeys(fetched)))
+    return ideas
+
+
+def _search_query(idea: dict) -> str:
+    """A news-search query from an idea's title, with figures left intact."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9',.]*", str(idea.get("title", "")))
+    return " ".join(w.strip(".,'") for w in words if w.strip(".,'"))
+
+
+def _search_for_more(idea: dict, found: list[str], trusted: int | None = None) -> list[str]:
+    """Top `found` up to MIN_SOURCES using the free Google News RSS search. Never raises."""
+    min_src = int(config.get("MIN_SOURCES", "2"))
+    have = len(found) if trusted is None else trusted
+    if have >= min_src or not config.get_bool("ENABLE_SOURCE_SEARCH", True):
+        return found
+    query = _search_query(idea)
+    results = news.search_stories(query, limit=max(min_src * 4, 8))
+    out = list(found)
+    for unique_publishers in (True, False):
+        seen_publishers: set[str] = set()
+        for story in results:
+            url = (story.get("url") or "").strip()
+            publisher = (story.get("source") or "").strip().lower()
+            if not url or url in out or _is_homepage(url):
+                continue
+            if unique_publishers and publisher and publisher in seen_publishers:
+                continue
+            seen_publishers.add(publisher)
+            out.append(url)
+            if len(out) >= min_src:
+                break
+        if len(out) >= min_src:
+            break
+    if len(out) > len(found):
+        log.info("ideation: search found %d more source(s) for %r",
+                 len(out) - len(found), idea.get("title"))
+    return out
+
+
+def _validate_and_clean(ideas: list[dict], existing: list[dict] | None = None) -> list[dict]:
+    """Keep well-formed, sufficiently-sourced, de-duplicated ideas; coerce fields."""
+    min_src = int(config.get("MIN_SOURCES", "2"))
+    niche = config.get("NICHE", "impact-news")
+    check_sources = config.get_bool("ENABLE_SOURCE_CHECK", True)
+    seen_titles: set[str] = {str(i.get("title", "")).lower() for i in (existing or [])}
+    kept_tokens: list[set[str]] = [_tokens(str(i.get("title", ""))) for i in (existing or [])]
+    clean: list[dict] = []
 
     for idea in ideas:
         if not isinstance(idea, dict):
@@ -120,76 +362,207 @@ def _validate(ideas: list[dict]) -> list[dict]:
             continue
         if title.lower() in seen_titles:
             continue
+        toks = _tokens(title)
+        if toks and any(len(toks & kt) / len(toks | kt) >= 0.6 for kt in kept_tokens):
+            log.debug("ideation_fallback: dropping near-duplicate %r", title)
+            continue
+        sources = _clean_sources(idea.get("sources"))
+        if check_sources and sources:
+            live = [s for s in sources if not _url_is_dead(s)]
+            if len(live) < len(sources):
+                log.warning("ideation_fallback: %r cited %d dead link(s): %s",
+                            title, len(sources) - len(live),
+                            [s for s in sources if s not in live])
+            sources = live
+        if len(sources) < min_src:
+            log.info("ideation_fallback: dropping %r (%d live source(s) < %d required)",
+                     title, len(sources), min_src)
+            continue
         try:
             est = float(idea.get("est_score", 0.5))
         except (TypeError, ValueError):
             est = 0.5
         est = min(1.0, max(0.0, est))
+        try:
+            share = float(idea.get("share_score", est))
+        except (TypeError, ValueError):
+            share = est
+        share = min(1.0, max(0.0, share))
 
         seen_titles.add(title.lower())
-        clean.append({
-            "niche": niche,
-            "title": title,
-            "hook": hook,
-            "angle": angle,
-            "est_score": est,
-        })
+        kept_tokens.append(toks)
+        clean.append({"niche": niche, "title": title, "hook": hook, "angle": angle,
+                      "est_score": est, "share_score": share, "sources": sources})
         if len(clean) >= _MAX_IDEAS:
             break
     return clean
 
 
-def _produce_ideas(n: int) -> list[dict]:
-    """Single LLM call. No headlines, no trends, no grounded search — fiction only."""
-    prompt = _PROMPT.format(n=n)
+_STAGE1_PROMPT = """You are the story scout for "But It Matters", a channel of daily 25-30 \
+second news/info Shorts (India + world). From the REAL headlines below, choose the {n} MOST \
+share-worthy, DISTINCT stories to turn into Shorts today.
+
+PRIMARY SOURCE — REAL CURRENT HEADLINES (choose from THESE; cluster items about the same event \
+into ONE story):
+{headlines}
+
+SUPPLEMENTARY TREND SIGNAL (optional flavour only; ignore generic weather/calendar/sports-score noise):
+{trending}
+
+WINNING STYLES ON THIS CHANNEL (what the feed rewards; pick stories with similar pull — if empty, ignore):
+{winners}
+
+RULES:
+- Pick {n} DISTINCT stories — NEVER two about the same event. Spread them across DIFFERENT \
+categories (world affairs, economy & business, science & space, technology & AI, health, \
+climate & energy, India infrastructure, government & policy, sports, notable world events).
+- Prefer stories a smart person would actually SEND TO A FRIEND: real stakes, money & power, \
+genuine surprise, big human impact. Apply a SHARE test, not a clickbait test.
+- Compliance (hard line): only real, VERIFIABLE developments — a viewpoint is fine, an \
+  unsourceable claim is not; exclude \
+communal/religious incitement, calls to violence, unverified rumour-as-fact, deepfakes, \
+graphic tragedy exploitation, medical/financial advice.
+
+Return ONLY a JSON object:
+{{"stories": [{{"story": "one-line description of the single development", "category": "...", \
+"why_shareworthy": "why someone would share this"}}]}}
+"""
+
+
+def _select_stories(target: int, headlines: list[str], trending: list[str],
+                    winners: list[str]) -> list[dict]:
+    """Stage 1: cluster real headlines into `target` DISTINCT share-worthy stories."""
+    if not headlines:
+        return []
+    prompt = _STAGE1_PROMPT.format(
+        n=target,
+        headlines="\n".join(f"- {h}" for h in headlines),
+        trending="\n".join(f"- {t}" for t in trending) or "- (none)",
+        winners="\n".join(f"- {w}" for w in winners) or "- (no performance data yet)",
+    )
     try:
-        raw = llm.generate(prompt, json=True, max_tokens=4096, prefer_groq=True)
+        raw = llm.generate(prompt, json=True, max_tokens=2048, prefer_groq=True)
+        start, end = raw.find("{"), raw.rfind("}")
+        data = json.loads(raw[start : end + 1], strict=False)
+        stories = data.get("stories", []) if isinstance(data, dict) else []
+        out: list[dict] = []
+        for s in stories:
+            if isinstance(s, dict) and str(s.get("story", "")).strip():
+                out.append({
+                    "story": str(s["story"]).strip(),
+                    "category": str(s.get("category", "")).strip(),
+                    "why_shareworthy": str(s.get("why_shareworthy", "")).strip(),
+                })
+        return out[:target]
     except Exception as e:  # noqa: BLE001
-        log.warning("ideation: LLM call failed (%s)", e)
-        raise
-    ideas = _parse_ideas(raw)
-    return _validate(ideas)
+        log.warning("ideation: stage-1 story selection failed (%s); expanding from headlines", e)
+        return []
+
+
+def _produce_ideas(target: int) -> list[dict]:
+    """Two-stage: select DISTINCT share-worthy stories (Stage 1), then expand them (Stage 2)."""
+    topics = trends.fetch_trending(15)
+    trending_block = "\n".join(f"- {t}" for t in topics) or \
+        "- (live trends unavailable — rely on the headlines below)"
+    feed_stories = news.fetch_stories(12)
+    headlines = [s["title"] for s in feed_stories]
+    headlines_block = "\n".join(f"- {h}" for h in headlines) or \
+        "- (no live headlines — use your knowledge of today's biggest REAL stories)"
+    try:
+        winners = db.top_performing_titles(6)
+    except Exception as e:  # noqa: BLE001
+        log.warning("ideation: could not load past winners (%s)", e)
+        winners = []
+    winners_block = "\n".join(f"- {w}" for w in winners) or "- (no performance data yet)"
+
+    stories = _select_stories(target, headlines, topics, winners)
+    if stories:
+        selected_block = "\n".join(
+            f"- {s['story']}" + (f" [{s['category']}]" if s["category"] else "")
+            for s in stories
+        )
+    else:
+        selected_block = ("- (no pre-selected stories — choose DISTINCT, current, "
+                          "share-worthy stories yourself; never two on the same event)")
+
+    prompt = _PROMPT.format(n=target, min_src=config.get("MIN_SOURCES", "2"),
+                            selected=selected_block, trending=trending_block,
+                            headlines=headlines_block, winners=winners_block)
+    clean: list[dict] = []
+    try:
+        raw, grounded = llm.generate_grounded_with_sources(prompt, max_tokens=8192)
+        parsed = _parse_ideas(raw)
+        clean = _validate_and_clean(_attach_real_sources(parsed, raw, grounded, feed_stories))
+        if not clean:
+            raise ValueError("grounded response yielded no valid ideas")
+    except Exception as e:  # noqa: BLE001
+        log.warning("ideation: grounded research unusable (%s); using ungrounded JSON mode", e)
+
+    if len(clean) >= target:
+        return clean
+    log.info("ideation: grounded pass yielded %d of %d; topping up ungrounded.", len(clean), target)
+    try:
+        raw = llm.generate(prompt, json=True, max_tokens=4096)
+        parsed = _attach_real_sources(_parse_ideas(raw), raw, [], feed_stories)
+        clean = clean + _validate_and_clean(parsed, existing=clean)
+    except Exception as e:  # noqa: BLE001
+        log.warning("ideation: ungrounded top-up failed (%s); keeping %d idea(s)", e, len(clean))
+    return clean[:_MAX_IDEAS]
 
 
 def run_fallback_ideation() -> int:
-    """Scheduled path: generate a fresh batch if no pending ideas exist. Idempotent."""
+    """Generate 15-20 ideas and insert them as 'pending'. Return the count inserted."""
     if db.get_pending_ideas():
-        log.info("ideation: pending ideas already exist; skipping (idempotent).")
+        log.info("ideation_fallback: pending ideas already exist; skipping (idempotent).")
         return 0
 
-    clean = _produce_ideas(3)
+    clean = _produce_ideas(18)
     if len(clean) < _MIN_IDEAS:
         raise RuntimeError(
-            f"ideation: only {len(clean)} valid ideas (need >= {_MIN_IDEAS}); "
+            f"ideation_fallback: only {len(clean)} valid ideas (need >= {_MIN_IDEAS}); "
             "not inserting a thin digest."
         )
+
     inserted = db.insert_ideas(_to_rows(clean))
-    log.info("ideation: inserted %d pending story idea(s).", len(inserted))
+    log.info("ideation_fallback: inserted %d pending ideas.", len(inserted))
     return len(inserted)
 
 
 def generate_ideas(n: int = 3) -> int:
-    """On-demand: generate exactly n fresh story ideas and insert as 'pending'."""
+    """On-demand: generate the best ~n fresh ideas and insert as 'pending'. Return the count."""
     n = max(1, n)
-    clean = _produce_ideas(n)
+    clean = sorted(_produce_ideas(max(n * 2, 4)), key=_rank_key)[:n]
     if not clean:
-        raise RuntimeError("ideation: could not generate any valid story idea.")
-    inserted = db.insert_ideas(_to_rows(clean[:n]))
-    log.info("ideation: generated %d on-demand story idea(s).", len(inserted))
+        raise RuntimeError("ideation: could not generate any valid idea.")
+    inserted = db.insert_ideas(_to_rows(clean))
+    log.info("ideation: generated %d on-demand idea(s).", len(inserted))
     return len(inserted)
 
 
-def seed_ideas(n: int = 3) -> int:
-    """Seed ~n fresh 'pending' ideas, de-duplicated against existing titles."""
-    pool = _produce_ideas(max(n * 2, 4))
-    seen = db.existing_idea_titles()
-    fresh = [i for i in pool if i["title"].lower() not in seen][:n]
-    if not fresh:
-        raise RuntimeError("ideation: no fresh story ideas to seed.")
-    log.info("ideation: seeding %d story idea(s).", len(fresh))
-    return len(db.insert_ideas(_to_rows(fresh)))
-
-
 def load_routine_ideas() -> list[dict]:
-    """Stub — no Claude Routine file for fiction. Returns []."""
-    return []
+    """Load + validate ideas the daily Anthropic Routine committed to the repo. [] if none."""
+    if not os.path.exists(_ROUTINE_IDEAS_FILE):
+        return []
+    try:
+        with open(_ROUTINE_IDEAS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("ideation: could not read %s (%s)", _ROUTINE_IDEAS_FILE, e)
+        return []
+    ideas = raw.get("ideas", []) if isinstance(raw, dict) else raw
+    return _validate_and_clean(ideas if isinstance(ideas, list) else [])
+
+
+def seed_ideas(n: int = 3) -> int:
+    """Seed ~n fresh 'pending' ideas for the on-demand digest. Return the count inserted."""
+    n = max(1, n)
+    routine = load_routine_ideas()
+    pool = routine if routine else _produce_ideas(max(n * 2, 4))
+    source = "routine file" if routine else "gemini/groq fallback"
+
+    seen = db.existing_idea_titles()
+    fresh = sorted((i for i in pool if i["title"].lower() not in seen), key=_rank_key)[:n]
+    if not fresh:
+        raise RuntimeError(f"ideation: no fresh ideas to seed (source: {source}).")
+    log.info("ideation: seeding %d idea(s) from %s.", len(fresh), source)
+    return len(db.insert_ideas(_to_rows(fresh)))
